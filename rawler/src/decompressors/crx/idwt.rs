@@ -30,6 +30,10 @@ pub(crate) struct WaveletTransform {
   band2_pos: usize,
   band3_pos: usize,
 
+  // Eight `Vec`s and not one flat block with a row table, which was tried: LibRaw keeps raw
+  // pointers into a single allocation, so a line access there is a load and an offset, while the
+  // safe equivalent has to rebuild a bounds-checked slice from the table on every access. That
+  // cost more than the locality returned - 283ms against 261ms single-threaded.
   line_buf: [Vec<i32>; 8],
   /// Current line position
   cur_line: usize,
@@ -76,11 +80,11 @@ impl WaveletTransform {
     }
   }
 
-  pub(super) fn getline(&mut self) -> &Vec<i32> {
-    let result = &self.line_buf[(self.flt_tap_h as i32 - self.cur_h as i32 + 5) as usize % 5 + 3];
+  pub(super) fn getline(&mut self) -> &[i32] {
+    let row = (self.flt_tap_h as i32 - self.cur_h as i32 + 5) as usize % 5 + 3;
     debug_assert!(self.cur_h > 0);
     self.cur_h -= 1;
-    result
+    &self.line_buf[row][..]
   }
 
   pub(super) fn band0(&mut self, offset: usize) -> i32 {
@@ -114,6 +118,20 @@ impl WaveletTransform {
   }
 }
 
+/// Copies the line the level below is holding into this level's LL band buffer.
+///
+/// Into the existing buffer rather than replacing it with a clone: this runs once per level per
+/// output row, so cloning allocated and freed a line-sized `Vec` some twenty thousand times for a
+/// 25MP frame. The copy itself is unavoidable - the two levels advance independently.
+#[inline]
+fn copy_lower_line(iwt_transforms: &mut [WaveletTransform], level: usize) {
+  let (lower, upper) = iwt_transforms.split_at_mut(level);
+  let source = lower[level - 1].getline();
+  let target = &mut upper[0].band0_buf;
+  target.clear();
+  target.extend_from_slice(source);
+}
+
 impl CodecParams {
   pub(super) fn idwt_53_filter_decode(
     &self,
@@ -135,10 +153,10 @@ impl CodecParams {
           self.idwt_53_filter_decode(tile, plane, params, iwt_transforms, level - 1)?;
         } else {
           let sband = &plane.subbands[cur_band];
-          iwt_transforms[level].band0_buf = self.decode_line_with_iquantization(sband, &mut params[cur_band], q_step_level)?;
+          self.decode_line_with_iquantization(sband, &mut params[cur_band], q_step_level, &mut iwt_transforms[level].band0_buf)?;
         }
         let sband = &plane.subbands[cur_band + 1];
-        iwt_transforms[level].band1_buf = self.decode_line_with_iquantization(sband, &mut params[cur_band + 1], q_step_level)?;
+        self.decode_line_with_iquantization(sband, &mut params[cur_band + 1], q_step_level, &mut iwt_transforms[level].band1_buf)?;
       }
     } else {
       if level > 0 {
@@ -146,13 +164,13 @@ impl CodecParams {
       } else {
         // LL band
         let sband = &plane.subbands[cur_band];
-        iwt_transforms[level].band0_buf = self.decode_line_with_iquantization(sband, &mut params[cur_band], q_step_level)?;
+        self.decode_line_with_iquantization(sband, &mut params[cur_band], q_step_level, &mut iwt_transforms[level].band0_buf)?;
       }
 
       // HL, LH and HH band
-      iwt_transforms[level].band1_buf = self.decode_line_with_iquantization(&plane.subbands[cur_band + 1], &mut params[cur_band + 1], q_step_level)?;
-      iwt_transforms[level].band2_buf = self.decode_line_with_iquantization(&plane.subbands[cur_band + 2], &mut params[cur_band + 2], q_step_level)?;
-      iwt_transforms[level].band3_buf = self.decode_line_with_iquantization(&plane.subbands[cur_band + 3], &mut params[cur_band + 3], q_step_level)?;
+      self.decode_line_with_iquantization(&plane.subbands[cur_band + 1], &mut params[cur_band + 1], q_step_level, &mut iwt_transforms[level].band1_buf)?;
+      self.decode_line_with_iquantization(&plane.subbands[cur_band + 2], &mut params[cur_band + 2], q_step_level, &mut iwt_transforms[level].band2_buf)?;
+      self.decode_line_with_iquantization(&plane.subbands[cur_band + 3], &mut params[cur_band + 3], q_step_level, &mut iwt_transforms[level].band3_buf)?;
     }
 
     Ok(())
@@ -245,18 +263,18 @@ impl CodecParams {
       let q_step_level = tile.q_step.as_ref().map(|f| &f[cur_level]);
 
       if cur_level > 0 {
-        iwt_transforms[cur_level].band0_buf = iwt_transforms[cur_level - 1].getline().clone();
+        copy_lower_line(iwt_transforms, cur_level);
       } else {
-        iwt_transforms[cur_level].band0_buf = self.decode_line_with_iquantization(&plane.subbands[cur_band], &mut params[cur_band], q_step_level)?;
+        self.decode_line_with_iquantization(&plane.subbands[cur_band], &mut params[cur_band], q_step_level, &mut iwt_transforms[cur_level].band0_buf)?;
       }
 
       let wvlt = &mut iwt_transforms[cur_level];
 
       let h0 = wvlt.flt_tap_h + 3;
       if wvlt.height > 1 {
-        wvlt.band1_buf = self.decode_line_with_iquantization(&plane.subbands[cur_band + 1], &mut params[cur_band + 1], q_step_level)?;
-        wvlt.band2_buf = self.decode_line_with_iquantization(&plane.subbands[cur_band + 2], &mut params[cur_band + 2], q_step_level)?;
-        wvlt.band3_buf = self.decode_line_with_iquantization(&plane.subbands[cur_band + 3], &mut params[cur_band + 3], q_step_level)?;
+        self.decode_line_with_iquantization(&plane.subbands[cur_band + 1], &mut params[cur_band + 1], q_step_level, &mut wvlt.band1_buf)?;
+        self.decode_line_with_iquantization(&plane.subbands[cur_band + 2], &mut params[cur_band + 2], q_step_level, &mut wvlt.band2_buf)?;
+        self.decode_line_with_iquantization(&plane.subbands[cur_band + 3], &mut params[cur_band + 3], q_step_level, &mut wvlt.band3_buf)?;
 
         let l0 = 0;
         let l1 = 1;
@@ -265,8 +283,8 @@ impl CodecParams {
 
         if tile.tiles_top {
           self.idwt_53_horizontal(tile, l0, 1, wvlt);
-          wvlt.band3_buf = self.decode_line_with_iquantization(&plane.subbands[cur_band + 3], &mut params[cur_band + 3], q_step_level)?;
-          wvlt.band2_buf = self.decode_line_with_iquantization(&plane.subbands[cur_band + 2], &mut params[cur_band + 2], q_step_level)?;
+          self.decode_line_with_iquantization(&plane.subbands[cur_band + 3], &mut params[cur_band + 3], q_step_level, &mut wvlt.band3_buf)?;
+          self.decode_line_with_iquantization(&plane.subbands[cur_band + 2], &mut params[cur_band + 2], q_step_level, &mut wvlt.band2_buf)?;
 
           // process L band
           if wvlt.width <= 1 {
@@ -319,7 +337,7 @@ impl CodecParams {
       } else {
         // This is unused in real world
 
-        wvlt.band1_buf = self.decode_line_with_iquantization(&plane.subbands[cur_band + 1], &mut params[cur_band + 1], q_step_level)?;
+        self.decode_line_with_iquantization(&plane.subbands[cur_band + 1], &mut params[cur_band + 1], q_step_level, &mut wvlt.band1_buf)?;
         let mut h0_pos = 0;
 
         // process H band
@@ -384,7 +402,7 @@ impl CodecParams {
             if iwt_transforms[level - 1].cur_h == 0 {
               self.idwt_53_filter_transform(tile, plane, params, iwt_transforms, level - 1)?;
             }
-            iwt_transforms[level].band0_buf = iwt_transforms[level - 1].getline().clone();
+            copy_lower_line(iwt_transforms, level);
           }
           let wvlt = &mut iwt_transforms[level];
           wvlt.reset_bufs();
@@ -470,7 +488,7 @@ impl CodecParams {
         if iwt_transforms[level - 1].cur_h == 0 {
           self.idwt_53_filter_transform(tile, plane, params, iwt_transforms, level - 1)?;
         }
-        iwt_transforms[level].band0_buf = iwt_transforms[level - 1].getline().clone();
+        copy_lower_line(iwt_transforms, level);
       }
       let wvlt = &mut iwt_transforms[level];
 
@@ -548,11 +566,29 @@ impl CodecParams {
       let l0 = 0;
       let l1 = 1;
       let l2 = 2;
-      for i in 0..wvlt.width {
-        let delta = wvlt.line_buf[l0][i] - ((wvlt.line_buf[l2][i] + wvlt.line_buf[l1][i] + 2) >> 2);
-        wvlt.line_buf[h1][i] = wvlt.line_buf[l1][i] + ((delta + wvlt.line_buf[h0][i]) >> 1);
-        wvlt.line_buf[h2][i] = delta;
+      // The two written lines moved out, so the six lines this reads and writes are plain slices
+      // of one known length instead of five `Vec<Vec<i32>>` lookups per element. That is what
+      // lets the bounds checks go and the loop vectorise; `perf` had these two lines at 5.8%.
+      // `h0`/`h1`/`h2` index 3..8 and `l0`/`l1`/`l2` are 0..3, so the six never overlap.
+      let mut out_h1 = std::mem::take(&mut wvlt.line_buf[h1]);
+      let mut out_h2 = std::mem::take(&mut wvlt.line_buf[h2]);
+      {
+        let width = wvlt.width;
+        let (a, b, c, d) = (
+          &wvlt.line_buf[l0][..width],
+          &wvlt.line_buf[l1][..width],
+          &wvlt.line_buf[l2][..width],
+          &wvlt.line_buf[h0][..width],
+        );
+        let (o1, o2) = (&mut out_h1[..width], &mut out_h2[..width]);
+        for i in 0..width {
+          let delta = a[i] - ((c[i] + b[i] + 2) >> 2);
+          o1[i] = b[i] + ((delta + d[i]) >> 1);
+          o2[i] = delta;
+        }
       }
+      wvlt.line_buf[h1] = out_h1;
+      wvlt.line_buf[h2] = out_h2;
 
       if iwt_transforms[level].cur_line >= iwt_transforms[level].height - 3 && iwt_transforms[level].height & 1 == 1 {
         iwt_transforms[level].cur_h += 3;

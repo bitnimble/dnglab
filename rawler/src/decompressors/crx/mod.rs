@@ -31,11 +31,10 @@
 
 use self::{mdat::Tile, rice::RiceDecoder};
 use crate::formats::bmff::ext_cr3::cmp1::Cmp1Box;
-use bitstream_io::BitReader;
 use log::debug;
-use std::io::Cursor;
 use thiserror::Error;
 
+mod bitpump;
 mod decoder;
 mod idwt;
 mod iquant;
@@ -58,8 +57,7 @@ const EX_COEF_NUM_TBL:[usize; 0x30*3] = [
     1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 2, 2, 2, 2, 1, 1, 1, 1, 2, 2, 1,
     1, 1, 1, 2, 2, 1, 1, 0, 1, 1, 1, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1];
 
-/// BitPump for Big Endian bit streams
-type BitPump<'a> = BitReader<Cursor<&'a [u8]>, bitstream_io::BigEndian>;
+use self::bitpump::BitPump;
 
 /// Error variants for compressor
 #[derive(Debug, Error)]
@@ -371,6 +369,15 @@ struct BandParam<'mdat> {
   supports_partial: bool,
   /// Rice decoder, provides bit access to the MDAT stream
   rice: RiceDecoder<'mdat>,
+  /// This band's lines, entropy-decoded and dequantised ahead of the wavelet, row-major.
+  ///
+  /// **Empty means decode on demand, which is the streaming path a row limit needs.** Otherwise
+  /// the wavelet takes lines from here instead of driving the entropy decoder itself, and the
+  /// point of that is threads: each band is its own bitstream, so filling these can run all
+  /// bands of all planes at once rather than the four planes the wavelet's own order allows.
+  predecoded: Vec<i32>,
+  /// Rows of `predecoded` already handed to the wavelet.
+  predecoded_row: usize,
 }
 
 impl<'mdat> BandParam<'mdat> {
@@ -420,4 +427,13 @@ pub fn decompress_crx_image(buf: &[u8], cmp1: &Cmp1Box) -> Result<Vec<u16>> {
   let image = CodecParams::new(cmp1)?;
   debug!("CRX codec parameter: {:?}", image);
   image.decode(buf)
+}
+
+/// As `decompress_crx_image`, but stopping once `last_row` has been decoded.
+///
+/// Rows below it are left at zero. See `CodecParams::decode_rows` for why this is the only
+/// partial decode the format allows, and why it is rows rather than a rectangle.
+pub fn decompress_crx_image_rows(buf: &[u8], cmp1: &Cmp1Box, last_row: usize) -> Result<Vec<u16>> {
+  let image = CodecParams::new(cmp1)?;
+  image.decode_rows(buf, last_row)
 }

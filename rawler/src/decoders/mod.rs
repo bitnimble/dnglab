@@ -330,6 +330,19 @@ impl RawMetadata {
 pub trait Decoder: Send {
   fn raw_image(&self, file: &RawSource, params: &RawDecodeParams, dummy: bool) -> Result<RawImage>;
 
+  /// As `raw_image`, but only guaranteeing the samples inside `region`.
+  ///
+  /// For a format stored in independently addressable pieces this decodes just the pieces the
+  /// region touches; the frame keeps its full dimensions and everything outside is left zero, so
+  /// coordinates are still the file's own. Whole pieces are decoded, so the valid area is the one
+  /// containing `region` rather than `region` exactly.
+  ///
+  /// The default decodes everything, which is always correct and is what a format with no such
+  /// structure has to do anyway.
+  fn raw_image_region(&self, file: &RawSource, params: &RawDecodeParams, _region: Rect, dummy: bool) -> Result<RawImage> {
+    self.raw_image(file, params, dummy)
+  }
+
   fn raw_image_count(&self) -> Result<usize> {
     Ok(1)
   }
@@ -355,6 +368,15 @@ pub trait Decoder: Send {
 
   fn preview_image(&self, _file: &RawSource, _params: &RawDecodeParams) -> Result<Option<DynamicImage>> {
     info!("Decoder has no preview image support");
+    Ok(None)
+  }
+
+  /// The preview's own bytes, undecoded, where it is a JPEG.
+  ///
+  /// `preview_image` decodes what it finds, which is the wrong shape for a caller that wants to
+  /// decode it itself - a preview is usually full resolution, and libjpeg can scale during the
+  /// decode, so handing back the bytes lets a caller that only wants a small one avoid the rest.
+  fn preview_jpeg<'a>(&self, _file: &'a RawSource, _params: &RawDecodeParams) -> Result<Option<&'a [u8]>> {
     Ok(None)
   }
 
@@ -1103,6 +1125,17 @@ impl RawLoader {
   pub fn decode_file(&self, path: &Path) -> Result<RawImage> {
     let rawfile = RawSource::new(path)?;
     self.decode(&rawfile, &RawDecodeParams::default(), false)
+  }
+
+  /// Decodes only enough of a file to cover `region`, where its format allows that.
+  ///
+  /// See `Decoder::raw_image_region`: the frame keeps its full dimensions and only the pieces the
+  /// region touches are decoded, so a caller reads the same coordinates either way. Formats with
+  /// nothing to skip decode whole, which is the default.
+  pub fn decode_file_region(&self, path: &Path, region: Rect) -> Result<RawImage> {
+    let rawfile = RawSource::new(path)?;
+    let decoder = self.get_decoder(&rawfile)?;
+    decoder.raw_image_region(&rawfile, &RawDecodeParams::default(), region, false)
   }
 
   /// Decodes a file into a RawImage

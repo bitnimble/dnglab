@@ -205,6 +205,16 @@ pub fn decode_file<P: AsRef<Path>>(path: P) -> Result<RawImage> {
   LOADER.decode_file(path.as_ref())
 }
 
+/// Take a path to a raw file and decode only enough of it to cover `region`
+///
+/// The image keeps the file's own dimensions and everything outside the decoded area is zero, so
+/// the samples are at the same coordinates a whole decode would put them. Formats stored in
+/// independently addressable tiles decode only the tiles the region touches; the rest decode
+/// whole, so this is never wrong, only sometimes faster.
+pub fn decode_file_region<P: AsRef<Path>>(path: P, region: imgop::Rect) -> Result<RawImage> {
+  LOADER.decode_file_region(path.as_ref(), region)
+}
+
 /// Take a readable source and return a decoded image or an error
 ///
 /// # Example

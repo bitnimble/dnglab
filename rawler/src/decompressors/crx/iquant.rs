@@ -11,9 +11,8 @@ use super::{
   mdat::{Subband, Tile},
 };
 use crate::decompressors::crx::{decoder::error_code_signed, rice::RiceDecoder};
-use bitstream_io::BitReader;
+use super::BitPump;
 use log::warn;
-use std::io::Cursor;
 
 /// QStep table for QP [0,1,2,3,4,5]
 #[rustfmt::skip]
@@ -56,10 +55,62 @@ impl CodecParams {
     }
   }
 
-  /// Decode line with inverse quantization
-  pub(super) fn decode_line_with_iquantization(&self, band: &Subband, param: &mut BandParam, q_step: Option<&QStep>) -> super::Result<Vec<i32>> {
+  /// Decodes a whole band ahead of the wavelet, so that `decode_line_with_iquantization` can
+  /// hand out its lines without touching the bitstream.
+  ///
+  /// **This is the one place the decoder can use more than four threads.** The wavelet pulls band
+  /// lines in an order that interleaves all ten subbands of a plane, which leaves the four planes
+  /// as the only things that can run at once - and a machine with twelve cores idles two thirds
+  /// of them. Each band is a separate bitstream over its own slice of the MDAT, so filled up
+  /// front they are all independent.
+  pub(super) fn predecode_band(&self, band: &Subband, param: &mut BandParam, q_step: Option<&QStep>) -> super::Result<()> {
     if band.data_size == 0 {
-      return Ok(Vec::new());
+      return Ok(());
+    }
+    let mut all = Vec::with_capacity(band.height * band.width);
+    let mut line = Vec::with_capacity(band.width);
+    // Bounded by the band's own bitstream rather than by `height`. The wavelet does not take
+    // `height` lines from every band - the levels advance at different rates and the last rows
+    // are handled apart - so filling to `height` reads off the end of the band's slice. Stopping
+    // where the stream stops gives exactly the lines that exist; a band that is genuinely short
+    // still reports, from the read in `decode_line_with_iquantization` that finds it missing.
+    for _ in 0..band.height {
+      match self.decode_line_with_iquantization(band, param, q_step, &mut line) {
+        Ok(()) => all.extend_from_slice(&line),
+        Err(_) => break,
+      }
+    }
+    param.predecoded = all;
+    param.predecoded_row = 0;
+    // Rewound, so the wavelet's reads start at the first line as if nothing had run yet.
+    param.cur_line = 0;
+    Ok(())
+  }
+
+  /// Decode line with inverse quantization
+  pub(super) fn decode_line_with_iquantization(
+    &self,
+    band: &Subband,
+    param: &mut BandParam,
+    q_step: Option<&QStep>,
+    out: &mut Vec<i32>,
+  ) -> super::Result<()> {
+    out.clear();
+    if band.data_size == 0 {
+      return Ok(());
+    }
+
+    // Already decoded, by `predecode_band` on some other thread. Same bytes, taken in the same
+    // order the wavelet would have driven them out in.
+    if !param.predecoded.is_empty() {
+      let at = param.predecoded_row * band.width;
+      let Some(line) = param.predecoded.get(at..at + band.width) else {
+        return Err(super::CrxError::Overflow(format!("band of {} has no line {}", band.width, param.predecoded_row)));
+      };
+      out.extend_from_slice(line);
+      param.predecoded_row += 1;
+      param.cur_line += 1;
+      return Ok(());
     }
 
     // only LL bands has support_partial, but quantization is not applied to
@@ -76,24 +127,36 @@ impl CodecParams {
       Some(q_step) => {
         // new version
         let q_step_tbl_ptr = &q_step.q_step_tbl[(q_step.width * band.get_subband_row(param.cur_line - 1))..];
+        // Hoisted: `decoded_buf_mut` reslices `line_buf[1]` behind a bounds check, and it was
+        // being called once per sample rather than once per line.
+        let buf = param.decoded_buf_mut();
 
-        for i in 0..band.col_start_addon {
-          let quant_val = band.q_step_base + ((q_step_tbl_ptr[0] * band.q_step_multi as u32) >> 3) as i32;
-          param.decoded_buf_mut()[i] *= constrain(quant_val, 1, 0x168000);
+        // One quantiser per table entry rather than per sample. `idx` only advances every
+        // `1 << level_shift` samples, and in the two edge runs it does not advance at all, so the
+        // multiplier was being recomputed - a load, a multiply, a shift and a clamp - for every
+        // sample that was going to reuse it. Walking the buffer in chunks also drops the bounds
+        // check on both the buffer and the table.
+        let quantiser = |entry: u32| constrain(band.q_step_base + ((entry * band.q_step_multi as u32) >> 3) as i32, 1, 0x168000);
+
+        let (head, rest) = buf.split_at_mut(band.col_start_addon);
+        let (middle, tail) = rest.split_at_mut(band.width - band.col_end_addon - band.col_start_addon);
+
+        let first = quantiser(q_step_tbl_ptr[0]);
+        for value in head.iter_mut() {
+          *value *= first;
         }
 
-        for i in band.col_start_addon..(band.width - band.col_end_addon) {
-          let idx = (i - band.col_start_addon) >> band.level_shift;
-          let quant_val = band.q_step_base + ((q_step_tbl_ptr[idx] * band.q_step_multi as u32) >> 3) as i32;
-          //eprintln!("{}", quant_val);
-          param.decoded_buf_mut()[i] *= constrain(quant_val, 1, 0x168000);
+        for (chunk, entry) in middle.chunks_mut(1 << band.level_shift).zip(q_step_tbl_ptr.iter()) {
+          let quant_val = quantiser(*entry);
+          for value in chunk.iter_mut() {
+            *value *= quant_val;
+          }
         }
 
         let last_idx = (band.width - band.col_end_addon - band.col_start_addon - 1) >> band.level_shift;
-
-        for i in (band.width - band.col_end_addon)..band.width {
-          let quant_val = band.q_step_base + ((q_step_tbl_ptr[last_idx] * band.q_step_multi as u32) >> 3) as i32;
-          param.decoded_buf_mut()[i] *= constrain(quant_val, 1, 0x168000);
+        let last = quantiser(q_step_tbl_ptr[last_idx]);
+        for value in tail.iter_mut() {
+          *value *= last;
         }
       }
       None => {
@@ -107,13 +170,14 @@ impl CodecParams {
         // Optimization: if scale is 1, no multiplication is required
         if q_scale != 1 {
           //println!("scale width: {}", band.width);
-          for i in 0..band.width {
-            param.decoded_buf_mut()[i] *= q_scale as i32;
+          for value in param.decoded_buf_mut().iter_mut() {
+            *value *= q_scale as i32;
           }
         }
       }
     }
-    Ok(Vec::from(param.decoded_buf()))
+    out.extend_from_slice(param.decoded_buf());
+    Ok(())
   }
 }
 
@@ -237,7 +301,7 @@ impl Tile {
       Some(qp_data) => {
         //println!("generate: size: {}", qp_data.mdat_qp_data_size);
         let mdat_qp = &data[self.data_offset..self.data_offset + qp_data.mdat_qp_data_size as usize];
-        let bitpump = BitReader::endian(Cursor::new(mdat_qp), bitstream_io::BigEndian);
+        let bitpump = BitPump::new(mdat_qp);
         let mut rice = RiceDecoder::new(bitpump);
 
         let qp_width = (self.plane_width >> 3) + if self.plane_width & 7 != 0 { 1 } else { 0 };

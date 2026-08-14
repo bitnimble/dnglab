@@ -3,6 +3,7 @@ use std::io::Cursor;
 
 use image::DynamicImage;
 use log::debug;
+use rayon::prelude::*;
 
 use crate::RawImage;
 use crate::RawLoader;
@@ -61,6 +62,8 @@ pub struct ArwDecoder<'a> {
   tiff: GenericTiffReader,
   makernote: IFD,
   camera: Camera,
+  /// Filled on first use; see `get_params`.
+  params: std::sync::OnceLock<ArwImageParams>,
 }
 
 impl<'a> ArwDecoder<'a> {
@@ -93,12 +96,18 @@ impl<'a> ArwDecoder<'a> {
       rawloader,
       makernote,
       camera,
+      params: std::sync::OnceLock::new(),
     })
   }
 }
 
 impl<'a> Decoder for ArwDecoder<'a> {
-  fn raw_image(&self, file: &RawSource, _params: &RawDecodeParams, dummy: bool) -> Result<RawImage> {
+  fn raw_image(&self, file: &RawSource, params: &RawDecodeParams, dummy: bool) -> Result<RawImage> {
+    // A region big enough to touch every tile, so the whole-frame decode is the same code path.
+    self.raw_image_region(file, params, Rect::new(Point::new(0, 0), Dim2::new(usize::MAX, usize::MAX)), dummy)
+  }
+
+  fn raw_image_region(&self, file: &RawSource, _params: &RawDecodeParams, region: Rect, dummy: bool) -> Result<RawImage> {
     let data = self.tiff.find_ifds_with_tag(TiffCommonTag::StripOffsets);
     if data.is_empty() {
       if self.camera.model == "DSLR-A100" {
@@ -144,7 +153,11 @@ impl<'a> Decoder for ArwDecoder<'a> {
         cpp = fetch_tiff_tag!(raw, TiffCommonTag::SamplesPerPixel).force_usize(0);
         // Starting with A-1, image is compressed in tiles with LJPEG92.
         // Data is RGGB for bayer readout and YCbCr for reduced resolution files.
-        ArwDecoder::decode_ljpeg(&self.camera, file, raw, dummy)?
+        match cpp {
+          // Bayer tiles are independently addressable, so only the ones `region` touches are read.
+          1 => ArwDecoder::decode_ljpeg_region(&self.camera, file, raw, region, dummy)?,
+          _ => ArwDecoder::decode_ljpeg(&self.camera, file, raw, dummy)?,
+        }
       }
       32766 => {
         let curve = ArwDecoder::get_curve(raw)?;
@@ -224,6 +237,20 @@ impl<'a> Decoder for ArwDecoder<'a> {
   /// Exiftool docs says there is a tag 0x2002 including the image, but this tag
   /// exists in none of the samples?! Instead, we can use the JPEG thumbnail
   /// tags which exists for most samples.
+  fn preview_jpeg<'b>(&self, file: &'b RawSource, params: &RawDecodeParams) -> Result<Option<&'b [u8]>> {
+    if params.image_index != 0 {
+      return Ok(None);
+    }
+    let root = self.tiff.root_ifd();
+    let (Some(off), Some(len)) = (
+      root.get_entry(ExifTag::JPEGInterchangeFormat),
+      root.get_entry(ExifTag::JPEGInterchangeFormatLength),
+    ) else {
+      return Ok(None);
+    };
+    Ok(file.subview(off.force_u64(0), len.force_u64(0)).ok())
+  }
+
   fn preview_image(&self, file: &RawSource, params: &RawDecodeParams) -> Result<Option<DynamicImage>> {
     if params.image_index != 0 {
       return Ok(None);
@@ -592,7 +619,103 @@ impl<'a> ArwDecoder<'a> {
     }
   }
 
+  /// Decodes only the LJPEG tiles that `region` touches, leaving the rest of the frame zero.
+  ///
+  /// **Sony's lossless compression is tiled in two dimensions, so a crop really is cheap.** The
+  /// TIFF carries one offset per tile and each is its own LJPEG stream, so nothing before or
+  /// beside the wanted tiles has to be decoded to reach them - unlike Canon's CRX, which is one
+  /// tile for the whole frame with prediction running down it. On a 61MP frame the tiles are
+  /// 512x512 in a 19x13 grid, so a 400px crop lands in four of two hundred and forty seven.
+  ///
+  /// The output keeps the full frame's dimensions so its coordinates stay the file's own; the
+  /// caller crops. Whole tiles are decoded, so what comes back is valid over the tile-aligned
+  /// rectangle containing `region`, not just over `region`.
+  pub(crate) fn decode_ljpeg_region(camera: &Camera, file: &RawSource, raw: &IFD, region: Rect, dummy: bool) -> Result<PixU16> {
+    let offsets = raw.get_entry(TiffCommonTag::TileOffsets).ok_or("Unable to find TileOffsets")?;
+    let width = fetch_tiff_tag!(raw, TiffCommonTag::ImageWidth).force_usize(0);
+    let height = fetch_tiff_tag!(raw, TiffCommonTag::ImageLength).force_usize(0);
+    let twidth = fetch_tiff_tag!(raw, TiffCommonTag::TileWidth).force_usize(0);
+    let tlength = fetch_tiff_tag!(raw, TiffCommonTag::TileLength).force_usize(0);
+    let cpp = fetch_tiff_tag!(raw, TiffCommonTag::SamplesPerPixel).force_usize(0);
+    let coltiles = (width - 1) / twidth + 1;
+    let rowtiles = (height - 1) / tlength + 1;
+
+    if cpp != 1 {
+      return Err(RawlerError::unsupported(camera, format!("ARW LJPEG region: unsupported cpp: {}", cpp)));
+    }
+    if coltiles * rowtiles != offsets.count() as usize {
+      return Err(RawlerError::unsupported(
+        camera,
+        format!("ARW LJPEG: trying to decode {} tiles from {} offsets", coltiles * rowtiles, offsets.count()),
+      ));
+    }
+
+    // The tiles the region touches, as half-open ranges over the tile grid.
+    let first_col = region.p.x / twidth;
+    let last_col = ((region.p.x + region.d.w).saturating_sub(1) / twidth).min(coltiles - 1);
+    let first_row = region.p.y / tlength;
+    let last_row = ((region.p.y + region.d.h).saturating_sub(1) / tlength).min(rowtiles - 1);
+    if first_col >= coltiles || first_row >= rowtiles {
+      return Err(RawlerError::DecoderFailed(format!("ARW LJPEG region {:?} is outside the {}x{} frame", region, width, height)));
+    }
+
+    // Borrowed, not `as_vec`: the source is already resident, and copying it out costs more than
+    // decoding the handful of tiles a crop wants.
+    let buffer = file.buf();
+    let mut out: PixU16 = alloc_image_ok!(width, height, dummy);
+
+    // One strip per tile row, so a strip's rows belong to it alone and the wanted ones can be
+    // handed out to threads without overlapping.
+    out
+      .pixels_mut()
+      .par_chunks_mut(width * tlength)
+      .enumerate()
+      .filter(|(row, _)| *row >= first_row && *row <= last_row)
+      .try_for_each(|(row, lines)| -> std::result::Result<(), String> {
+        for col in first_col..=last_col {
+          let offset = offsets.force_usize(row * coltiles + col);
+          let src = &buffer[offset..];
+          let decompressor = LjpegDecompressor::new(src)?;
+          // A 512x512 bayer tile arrives as 256x256 of four components, one per CFA position.
+          let (w, h, cpp) = (256, 256, 4);
+          let mut data = vec![0; h * w * cpp];
+          decompressor.decode(&mut data, 0, w * cpp, w * cpp, h, dummy)?;
+
+          let mut strip = &mut *lines;
+          for line in data.chunks_exact(w * cpp) {
+            for (i, chunk) in line.chunks_exact(4).enumerate() {
+              // Unpack chunks of RGGB pixel data into two output lines
+              // so the first line is RGRGRG and the second one is GBGBGB.
+              strip[col * twidth + i * 2] = chunk[0];
+              strip[col * twidth + i * 2 + 1] = chunk[1];
+              strip[width + col * twidth + i * 2] = chunk[2];
+              strip[width + col * twidth + i * 2 + 1] = chunk[3];
+            }
+            // Now move output strip by two rows.
+            strip = &mut strip[width * 2..];
+          }
+        }
+        Ok(())
+      })
+      .map_err(RawlerError::DecoderFailed)?;
+    Ok(out)
+  }
+
+  /// The white balance and levels, decrypted once per decoder.
+  ///
+  /// **Held because it costs 64ms and does not depend on what is being decoded.** Sony keeps
+  /// these behind an encrypted block, so reading them means decrypting it and parsing an IFD out
+  /// of the result - the same answer every time, and on a 61MP frame more than the whole rest of
+  /// a tiled decode. A reader taking crop after crop of one photograph pays it once.
   fn get_params(&self, file: &RawSource) -> Result<ArwImageParams> {
+    if let Some(params) = self.params.get() {
+      return Ok(params.clone());
+    }
+    let params = self.read_params(file)?;
+    Ok(self.params.get_or_init(|| params).clone())
+  }
+
+  fn read_params(&self, file: &RawSource) -> Result<ArwImageParams> {
     let priv_offset = {
       let tag = fetch_tiff_tag!(self.tiff, TiffCommonTag::DNGPrivateArea).get_data();
       LEu32(tag, 0)
@@ -797,7 +920,7 @@ fn sony_tag9cxx_decipher(data: &[u8]) -> Vec<u8> {
   buf
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ArwImageParams {
   wb: [f32; 4],
   blacklevel: Option<[u16; 4]>,

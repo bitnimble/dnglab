@@ -128,8 +128,15 @@ pub(crate) fn parse_colordata(colordata: &Entry) -> Result<ColorData> {
         32 | 33 => ColorData::new(data, version, 0x55, Some(0x157), Some(0x32a), Some(0x32b)),
         // 34 (R3)
         34 => ColorData::new(data, version, 0x69, Some(0x16b), Some(0x280), Some(0x281)),
-        // 48 (R7/R10)
-        48 => ColorData::new(data, version, 0x69, Some(0x16b), Some(0x281), Some(0x282)),
+        // 48 (R7/R10/R8)
+        //
+        // The white levels sit at 0x280 and 0x281, one word earlier than they were read here. What
+        // 0x282 holds is 0x31bf, repeated at 0x283 and identical on an R8 and an R10 whose black
+        // levels and normal white levels both differ - a constant, not a per-body white level. Read
+        // correctly, an R8 gives 13535 and 14888 and an R10 13035 and 14338, and specular sits
+        // above normal as it does in every other version here. Version 34 shares this layout
+        // exactly, black at 0x16b and the white levels at 0x280 and 0x281.
+        48 => ColorData::new(data, version, 0x69, Some(0x16b), Some(0x280), Some(0x281)),
         // 64 (R5MK2), 65 (R50V), 66 (R6MK3)
         64 | 65 | 66 => ColorData::new(data, version, 0x69, Some(0x17f), Some(0x294), Some(0x295)),
 

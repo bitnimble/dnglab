@@ -301,6 +301,19 @@ impl<'a> Decoder for Cr2Decoder<'a> {
     Ok(self.xpacket.clone())
   }
 
+  fn preview_jpeg<'b>(&self, file: &'b RawSource, params: &RawDecodeParams) -> Result<Option<&'b [u8]>> {
+    if params.image_index != 0 {
+      return Ok(None);
+    }
+    let root_ifd = self.tiff.root_ifd();
+    // Compression 1 is the uncompressed case `preview_image` handles separately; only a JPEG can be
+    // handed back undecoded.
+    if root_ifd.get_entry(TiffCommonTag::Compression).map(|c| c.force_usize(0)) == Some(1) {
+      return Ok(None);
+    }
+    Ok(root_ifd.singlestrip_data_rawsource(file).ok())
+  }
+
   fn preview_image(&self, file: &RawSource, params: &RawDecodeParams) -> Result<Option<DynamicImage>> {
     if params.image_index != 0 {
       return Ok(None);

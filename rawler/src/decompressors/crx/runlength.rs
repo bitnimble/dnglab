@@ -5,7 +5,7 @@
 // Rewritten in Rust by Daniel Vogelbacher, based on logic found in
 // crx.cpp and documentation done by Laurent Clévy (https://github.com/lclevy/canon_cr3).
 
-use super::{BandParam, CodecParams, CrxError, Result};
+use super::{BandParam, BitPump, CodecParams, CrxError, Result};
 
 /// See ITU T.78 Section A.2.1 Step 3
 /// Initialise the variables for the run mode: RUNindex=0 and J[0..31]
@@ -30,25 +30,35 @@ impl CodecParams {
   /// Get symbol run count for run-length decoding
   /// See T.87 Section A.7.1.2 Run-length coding
   pub(super) fn symbol_run_count(&self, param: &mut BandParam, remaining: u32) -> Result<u32> {
+    let (mut pump, k) = param.rice.split();
+    let count = self.symbol_run_count_at(&mut pump, &mut param.s_param, remaining);
+    param.rice.rejoin(pump, k);
+    count
+  }
+
+  /// The same, over a pump the caller is already holding as a local, so a line loop that has
+  /// borrowed its buffers as slices does not have to give them back to make this call.
+  #[inline(always)]
+  pub(super) fn symbol_run_count_at(&self, pump: &mut BitPump<'_>, s_param: &mut u32, remaining: u32) -> Result<u32> {
     debug_assert!(remaining > 1);
     let mut run_cnt: u32 = 1;
     // See T.87 A.7.1.2 Code segment A.15
     // Bitstream 111110... means 5 lookups into J to decode final RUNcnt
-    while run_cnt != remaining && param.rice.bitstream_get_bits(1)? == 1 {
+    while run_cnt != remaining && pump.read_bits(1)? == 1 {
       // JS is precalculated (1 << J[RUNindex])
-      run_cnt += JSHIFT[param.s_param as usize];
+      run_cnt += JSHIFT[*s_param as usize];
       if run_cnt > remaining {
         run_cnt = remaining;
         break;
       }
-      param.s_param = std::cmp::min(param.s_param + 1, 31);
+      *s_param = std::cmp::min(*s_param + 1, 31);
     }
     // See T.87 A.7.1.2 Code segment A.16
     if run_cnt < remaining {
-      if J[param.s_param as usize] > 0 {
-        run_cnt += param.rice.bitstream_get_bits(J[param.s_param as usize])?;
+      if J[*s_param as usize] > 0 {
+        run_cnt += pump.read_bits(J[*s_param as usize])?;
       }
-      param.s_param = param.s_param.saturating_sub(1); // prevent underflow
+      *s_param = s_param.saturating_sub(1); // prevent underflow
       if run_cnt > remaining {
         //println!("run_cnt: {}, remaining: {}", run_cnt, remaining);
         return Err(CrxError::General("Crx decoder error while decoding line".to_string()));

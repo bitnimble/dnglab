@@ -7,9 +7,14 @@
 
 use super::BitPump;
 use super::Result;
-use bitstream_io::BitRead;
 
 /// Adaptive Golomb-Rice decoder
+///
+/// `Copy` so a decode loop can lift the whole decoder into a local for the length of a line and
+/// put it back once. Behind a `&mut` every read of the bit cache and the K parameter is a memory
+/// access the compiler cannot promote; as a local they live in registers, which is the shape
+/// LibRaw's `crx.cpp` gets by keeping `bitData`/`bitsLeft` in the decode function itself.
+#[derive(Clone, Copy)]
 pub(super) struct RiceDecoder<'mdat> {
   /// Bitstream from MDAT
   bitpump: BitPump<'mdat>,
@@ -34,55 +39,37 @@ impl<'mdat> RiceDecoder<'mdat> {
     self.k_param = k;
   }
 
-  /// Return the positive number of 0-bits in bitstream.
-  /// All 0-bits are consumed.
-  #[inline(always)]
-  pub(super) fn bitstream_zeros(&mut self) -> Result<u32> {
-    Ok(self.bitpump.read_unary::<1>()?)
-  }
-
   /// Return the requested bits
   // All bits are consumed.
   // The maximum number of bits are 32
   #[inline(always)]
   pub(super) fn bitstream_get_bits(&mut self, bits: u32) -> Result<u32> {
     debug_assert!(bits <= 32);
-    Ok(self.bitpump.read_var(bits)?)
-  }
-
-  /// Golomb-Rice decoding
-  /// https://w3.ual.es/~vruiz/Docencia/Apuntes/Coding/Text/03-symbol_encoding/09-Golomb_coding/index.html
-  /// escape and esc_bits are used to interrupt decoding when
-  /// a value is not encoded using Golomb-Rice but directly encoded
-  /// by esc_bits bits.
-  fn rice_decode(&mut self, escape: u32, esc_bits: u32) -> Result<u32> {
-    // q, quotient = n//m, with m = 2^k (Rice coding)
-    let prefix = self.bitstream_zeros()?;
-    if prefix >= escape {
-      // n
-      Ok(self.bitstream_get_bits(esc_bits)?)
-    } else if self.k_param > 0 {
-      // Golomb-Rice coding : n = q * 2^k + r, with r is next k bits. r is n - (q*2^k)
-      Ok((prefix << self.k_param) | self.bitstream_get_bits(self.k_param)?)
-    } else {
-      // q
-      Ok(prefix)
-    }
+    self.bitpump.read_bits(bits)
   }
 
   /// Adaptive Golomb-Rice decoding, by adapting k value
   /// Sometimes adapting is based on the next coefficent (n) instead
   /// of current (x) coefficent. So you can disable it with `adapt_k`
   /// and update k later.
+  #[inline(always)]
   pub(super) fn adaptive_rice_decode(&mut self, adapt_k: bool, escape: u32, esc_bits: u32, k_max: u32) -> Result<u32> {
-    let val = self.rice_decode(escape, esc_bits)?;
-    if adapt_k {
-      self.k_param = Self::predict_k_param_max(self.k_param, val, k_max);
-    }
-    Ok(val)
+    adaptive_rice_decode(&mut self.bitpump, &mut self.k_param, adapt_k, escape, esc_bits, k_max)
+  }
+
+  /// The pump and the K parameter, for a caller that will hold them in locals.
+  pub(super) fn split(&self) -> (BitPump<'mdat>, u32) {
+    (self.bitpump, self.k_param)
+  }
+
+  /// Both back, after such a caller is done with them.
+  pub(super) fn rejoin(&mut self, bitpump: BitPump<'mdat>, k: u32) {
+    self.bitpump = bitpump;
+    self.k_param = k;
   }
 
   /// Update current K parameter
+  #[inline(always)]
   pub(super) fn update_k_param(&mut self, bit_code: u32, k_max: u32) {
     self.k_param = Self::predict_k_param_max(self.k_param, bit_code, k_max);
   }
@@ -91,18 +78,45 @@ impl<'mdat> RiceDecoder<'mdat> {
   /// Golomb-Rice becomes more efficient when used with an adaptive
   /// K parameter. This is done by predicting the next K value for the
   /// next sample value.
+  #[inline(always)]
   fn predict_k_param_max(prev_k: u32, value: u32, k_max: u32) -> u32 {
-    let mut new_k = prev_k;
-    if value >> prev_k > 2 {
-      new_k += 1;
-    }
-    if value >> prev_k > 5 {
-      new_k += 1;
-    }
-    if value < ((1 << prev_k) >> 1) {
-      new_k -= 1;
-    }
+    // Branchless, and the shift taken once. These three conditions are decided by entropy-coded
+    // data, so they are the least predictable branches in the decoder and they run once per
+    // sample - `perf` put the two surviving ones at 8.9% between them. The subtraction cannot
+    // underflow: at `prev_k == 0` its condition is `value < 0`, which no `u32` satisfies.
+    let shifted = value >> prev_k;
+    let new_k = prev_k + u32::from(shifted > 2) + u32::from(shifted > 5) - u32::from(value < ((1 << prev_k) >> 1));
 
     if k_max > 0 { std::cmp::min(new_k, k_max) } else { new_k }
   }
 }
+
+/// The same decode, over a pump and a K the caller is holding in locals.
+///
+/// The hot line loop keeps both in registers for the length of a line and puts them back once
+/// (`RiceDecoder::split` / `rejoin`); behind `&mut self` every read of the bit cache is a memory
+/// access the compiler cannot promote. The method above is this function, so there is one
+/// implementation rather than two that have to agree.
+#[inline(always)]
+pub(super) fn adaptive_rice_decode(
+  pump: &mut BitPump<'_>,
+  k: &mut u32,
+  adapt_k: bool,
+  escape: u32,
+  esc_bits: u32,
+  k_max: u32,
+) -> Result<u32> {
+  let prefix = pump.read_zeros()?;
+  let val = if prefix >= escape {
+    pump.read_bits(esc_bits)?
+  } else if *k > 0 {
+    (prefix << *k) | pump.read_bits(*k)?
+  } else {
+    prefix
+  };
+  if adapt_k {
+    *k = RiceDecoder::predict_k_param_max(*k, val, k_max);
+  }
+  Ok(val)
+}
+

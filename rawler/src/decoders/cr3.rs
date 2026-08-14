@@ -416,6 +416,19 @@ impl<'a> Decoder for Cr3Decoder<'a> {
     Ok(img)
   }
 
+  fn preview_jpeg<'b>(&self, file: &'b RawSource, params: &RawDecodeParams) -> Result<Option<&'b [u8]>> {
+    if params.image_index != 0 || rawler_ignore_previews() {
+      return Ok(None);
+    }
+    let stbl = &self.bmff.filebox.moov.traks[0].mdia.minf.stbl;
+    let Some(co64) = stbl.co64.as_ref() else {
+      return Ok(None);
+    };
+    let offset = co64.entries[0];
+    let size = stbl.stsz.sample_sizes[0] as u64;
+    Ok(file.subview(offset, size).ok())
+  }
+
   /// Extract preview image embedded in CR3
   fn preview_image(&self, file: &RawSource, params: &RawDecodeParams) -> Result<Option<DynamicImage>> {
     if params.image_index != 0 {

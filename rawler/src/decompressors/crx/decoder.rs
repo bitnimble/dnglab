@@ -10,11 +10,35 @@ use super::{
   mdat::{Plane, Tile},
 };
 use crate::decompressors::crx::{idwt::WaveletTransform, mdat::parse_header, rice::RiceDecoder};
-use bitstream_io::BitReader;
+use super::BitPump;
 use itertools::izip;
 use log::debug;
 use rayon::prelude::*;
-use std::{convert::TryInto, io::Cursor, time::Instant};
+use std::convert::TryInto;
+
+// LOCAL PATCH (bowerbird). Upstream times this decode with `std::time::Instant`, which
+// wasm32-unknown-unknown has no clock for: `Instant::now()` panics with "time not
+// implemented on this platform", so every CR3 decode in a browser trapped. The timing is
+// a debug log line, so on wasm it reports zero rather than bringing the decode down.
+//
+// The whole of this vendored crate exists for these few lines; upstream's fix is to gate
+// the timing on `#[cfg(not(target_arch = "wasm32"))]`.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+struct Instant;
+
+#[cfg(target_arch = "wasm32")]
+impl Instant {
+  fn now() -> Self {
+    Self
+  }
+
+  fn elapsed(&self) -> std::time::Duration {
+    std::time::Duration::ZERO
+  }
+}
 
 /// Maximum value for K during Adaptive Golomb-Rice for K prediction
 pub(super) const PREDICT_K_MAX: u32 = 15;
@@ -52,7 +76,7 @@ impl<'a> PlaneLineIter<'a> {
       let band_buf = &data[band_mdat_offset..band_mdat_offset + band.data_size];
       // Line length is subband + one additional pixel at start and end
       let line_len = 1 + band.width + 1;
-      let bitpump = BitReader::endian(Cursor::new(band_buf), bitstream_io::BigEndian);
+      let bitpump = BitPump::new(band_buf);
 
       let param = BandParam {
         subband_width: band.width,
@@ -68,6 +92,8 @@ impl<'a> PlaneLineIter<'a> {
         q_param: band.q_param,
         supports_partial: plane.support_partial && band_id == 0,
         rice: RiceDecoder::new(bitpump),
+        predecoded: Vec::new(),
+        predecoded_row: 0,
       };
       params.push(param);
     }
@@ -127,35 +153,49 @@ impl<'a> PlaneLineIter<'a> {
   }
 }
 
-/// Iterator over a plane, returning on each call a new decoded line
-impl<'a> Iterator for PlaneLineIter<'a> {
-  type Item = Result<PlaneLine>;
+/// Decodes `rows` lines of a plane into one contiguous buffer, row-major.
+///
+/// Contiguous rather than a vector of rows, and taken straight from `decode_plane_line` rather
+/// than through the `Iterator` impl this replaces: that handed back an owned `Vec` per line, some
+/// eight thousand of them for a 25MP frame, each a fresh allocation and a copy of a buffer the
+/// decoder had just filled. Worth about 5% of a single-threaded decode.
+fn decode_full_plane(codec: &CodecParams, tile: &Tile, plane: &Plane, mdat: &[u8], rows: usize) -> Result<Vec<i32>> {
+  let mut lines = PlaneLineIter::new(*codec, tile, plane, mdat)?;
+  let rows = rows.min(tile.plane_height);
 
-  fn next(&mut self) -> Option<Self::Item> {
-    if self.next_row < self.tile.plane_height {
-      match self.decode_plane_line() {
-        Ok(line) => Some(Ok(line.into())),
-        Err(e) => Some(Err(e)),
-      }
-    } else {
-      None
-    }
+  // Only for a wavelet plane, only for a whole one, and only where there are threads to put it on.
+  //
+  // **`levels == 0` must not pre-decode**: that plane has one band and no wavelet, and
+  // `decode_plane_line` takes its line straight from `decode_line` rather than through
+  // `decode_line_with_iquantization`, which is the only reader of the cache. Filling it there
+  // consumes the band's bitstream and hands back nothing, so the line decode that follows reads a
+  // stream already at its end - a wrong picture where it does not fail outright.
+  //
+  // A row limit is asking to stop early, and a band decoded up front is decoded in full, so
+  // pre-decoding would spend exactly what the limit exists to save. The thread count is the other
+  // half: buffering every band costs a pass over the whole plane again, which pays for itself
+  // only once there are more cores than the four planes can occupy. Measured on a 24MP CR3, this
+  // path is 77ms against 61ms at twelve threads and 90ms against 114ms at four.
+  if codec.levels > 0 && rows == tile.plane_height && rayon::current_num_threads() > usize::from(codec.plane_count) {
+    let q_step = tile.q_step.as_ref();
+    lines
+      .params
+      .par_iter_mut()
+      .zip(plane.subbands.par_iter())
+      .enumerate()
+      .try_for_each(|(band_id, (param, band))| {
+        // Which wavelet level a band belongs to, and so which quantiser table it takes:
+        // `idwt_53_filter_decode` reads bands `3 * level + 1 ..= 3 * level + 3`, with the LL
+        // band 0 sitting at level 0 beside them.
+        let level = if band_id == 0 { 0 } else { (band_id - 1) / 3 };
+        codec.predecode_band(band, param, q_step.map(|steps| &steps[level]))
+      })?;
   }
-
-  fn size_hint(&self) -> (usize, Option<usize>) {
-    (0, Some(self.tile.plane_height))
+  let mut out = Vec::with_capacity(rows * tile.plane_width);
+  for _ in 0..rows {
+    out.extend_from_slice(lines.decode_plane_line()?);
   }
-}
-
-/// A plane line is a vector if i32 values
-type PlaneLine = Vec<i32>;
-
-/// Wrapper for PlaneLineIter
-/// Decodes a complete plane and returns it as vector of lines
-fn decode_full_plane(codec: &CodecParams, tile: &Tile, plane: &Plane, mdat: &[u8]) -> Result<Vec<PlaneLine>> {
-  //eprintln!("Process tile {}, plane: {}", tile.id, plane.id);
-  let line_decoder = PlaneLineIter::new(*codec, tile, plane, mdat)?;
-  line_decoder.collect()
+  Ok(out)
 }
 
 impl CodecParams {
@@ -163,9 +203,25 @@ impl CodecParams {
   ///
   /// Decoding processes all planes in all tiles and assembles the
   /// decoded planes into proper tile output position and CFA pattern.
-  pub fn decode(mut self, mdat: &[u8]) -> Result<Vec<u16>> {
+  pub fn decode(self, mdat: &[u8]) -> Result<Vec<u16>> {
+    self.decode_rows(mdat, usize::MAX)
+  }
+
+  /// Decode the image down to `last_row`, leaving everything below it zero.
+  ///
+  /// **The only partial decode CRX allows, and it is one-dimensional.** A crop cannot be seeked
+  /// to: prediction reads the line above and the 5/3 wavelet spans lines, so row N costs every
+  /// row before it. Nor can tiles be skipped - Canon writes one tile for the whole frame, which
+  /// is also why both this decoder and LibRaw's stop scaling at four threads (the four colour
+  /// planes, not tiles). What is left is stopping early, which is worth having for a magnifier:
+  /// a crop halfway down the frame costs half the decode, and one near the top costs almost none.
+  ///
+  /// `last_row` is in image rows. Rounded up to a whole plane row, since each plane carries every
+  /// other line of the frame.
+  pub fn decode_rows(mut self, mdat: &[u8], last_row: usize) -> Result<Vec<u16>> {
     let instant = Instant::now();
     debug!("Tile configuration: rows: {}, columns: {}", self.tile_rows, self.tile_cols);
+    let plane_rows = last_row.saturating_div(2).saturating_add(1);
     // Build nested Tiles/Planes/Bands
     let mut tiles = parse_header(self.get_header(mdat))?;
     self.process_tiles(&mut tiles);
@@ -178,25 +234,64 @@ impl CodecParams {
 
     // Combine all tiles and planes into parallel iterators
     // and decode the full planes.
-    let plane_bufs: Result<Vec<Vec<Vec<PlaneLine>>>> = tiles
+    let plane_bufs: Result<Vec<Vec<Vec<i32>>>> = tiles
       .par_iter()
-      .map(|tile| tile.planes.par_iter().map(move |plane| decode_full_plane(&self, tile, plane, mdat)).collect())
+      .map(|tile| {
+        tile
+          .planes
+          .par_iter()
+          .map(move |plane| decode_full_plane(&self, tile, plane, mdat, plane_rows))
+          .collect()
+      })
       .collect();
 
     // Now we have a list of tiles->planes->plane-lines
     // and can combine them to the final CFA
+    // One tile, which is what Canon actually writes: every plane row then owns two CFA rows
+    // outright, so the conversion can be split across threads by row with no overlap to
+    // reconcile. It is worth the special case - the serial version of this stage is about half
+    // the wall time of a threaded decode, because the four-way plane parallelism above finishes
+    // and then everything queues behind one core doing the colour conversion. LibRaw splits the
+    // same stage over `planeHeight` for the same reason.
+    if let Ok(bufs) = plane_bufs.as_ref()
+      && bufs.len() == 1
+      && bufs[0].len() == 4
+    {
+      let planes = &bufs[0];
+      let width = self.image_width;
+      let plane_width = tiles[0].plane_width;
+      let (p0, p1, p2, p3) = (&planes[0], &planes[1], &planes[2], &planes[3]);
+      let decoded_rows = p0.len() / plane_width;
+      cfa
+        .par_chunks_mut(2 * width)
+        .enumerate()
+        .take(decoded_rows)
+        .try_for_each(|(plane_row, rows)| {
+          let at = plane_row * plane_width;
+          let to = at + plane_width;
+          convert_rows_into_cfa(&self, rows, width, &p0[at..to], &p1[at..to], &p2[at..to], &p3[at..to])
+        })?;
+      debug!("MDAT decoding and CFA build: {} s", instant.elapsed().as_secs_f32());
+      return Ok(cfa);
+    }
+
     match plane_bufs {
       Ok(bufs) => {
         for (tile_id, tile) in bufs.into_iter().enumerate() {
           let plane_count = tile.len();
           debug_assert_eq!(plane_count, 4);
           // Convert vector of planes to excact count of 4 planes - or fail
-          let planes: [Vec<PlaneLine>; 4] = tile
+          let planes: [Vec<i32>; 4] = tile
             .try_into()
             .map_err(|_| CrxError::General(format!("Invalid plane count {} (expected 4) for tile {}", plane_count, tile_id)))?;
-          // References to all 4 plane buffers
-          let (p0, p1, p2, p3) = (&planes[0], &planes[1], &planes[2], &planes[3]);
-          // Process each PlaneLine in all 4 buffers
+          // Each plane is one contiguous buffer, so its rows are chunks of the tile's plane width
+          let plane_width = tiles[tile_id].plane_width;
+          let (p0, p1, p2, p3) = (
+            planes[0].chunks_exact(plane_width),
+            planes[1].chunks_exact(plane_width),
+            planes[2].chunks_exact(plane_width),
+            planes[3].chunks_exact(plane_width),
+          );
           for (plane_row, (l0, l1, l2, l3)) in izip!(p0, p1, p2, p3).enumerate() {
             let (c0, c1, c2, c3) = convert_plane_line(&self, l0, l1, l2, l3)?;
             integrate_cfa(&self, &tiles, &mut cfa, tile_id, 0, plane_row, &c0)?;
@@ -273,67 +368,92 @@ impl CodecParams {
     //println!("Decode nontop {}", p.cur_line);
     debug_assert_eq!(p.line_pos, 1);
     let mut remaining = p.subband_width as u32;
+    // Borrowed field by field so the two line buffers are plain slices for the loop below. Read
+    // through `p`, every one of the seven accesses per sample is a fresh walk from the struct to
+    // a `Vec`'s heap block, and the bounds check that goes with it cannot be hoisted out of the
+    // loop because the compiler cannot know the `Vec` did not move.
+    let BandParam { line_buf, line_k, rice, s_param, line_pos, .. } = p;
+    let [above, current] = line_buf;
+    // Cut to one common length so a single check can stand for all of them. Every access below is
+    // `pos - 1`, `pos` or `pos + 1` into one of these three, and left as separate slices of
+    // separately-known lengths that is seven bounds checks a sample - which is where `perf` puts
+    // `core::slice::index`, second only to the decode itself.
+    let span = above.len().min(current.len()).min(line_k.len());
+    let above = &above.as_slice()[..span];
+    let current = &mut current.as_mut_slice()[..span];
+    let line_k = &mut line_k[..span];
+    // The decoder as a local for the length of the line, put back below. An error leaves it
+    // behind, which costs nothing: a band that failed to decode is not decoded further.
+    let (mut pump, mut k) = rice.split();
+    let mut pos = *line_pos;
     while remaining > 1 {
+      // The one check the rest of the iteration rides on: `pos + 1` is the furthest any access
+      // below reaches, and `pos` is at least 1 on entry and only ever grows.
+      if pos + 1 >= span {
+        return Err(CrxError::Overflow(format!("line position {pos} is past the {span} the line has")));
+      }
       // Loop over full width of line (backwards)
-      if (p.coeff_d() | p.coeff_b() | p.coeff_a()) != 0 {
-        let bit_code = p.rice.adaptive_rice_decode(true, PREDICT_K_ESCAPE, PREDICT_K_ESCBITS, 0)?;
-        p.line_buf[1][p.line_pos] = error_code_signed(bit_code);
-        if p.line_k[p.line_pos].saturating_sub(p.rice.k()) <= 1 {
-          if p.rice.k() >= 15 {
-            p.rice.set_k(15);
+      if (above[pos + 1] | above[pos] | current[pos - 1]) != 0 {
+        let bit_code = crate::decompressors::crx::rice::adaptive_rice_decode(&mut pump, &mut k, true, PREDICT_K_ESCAPE, PREDICT_K_ESCBITS, 0)?;
+        current[pos] = error_code_signed(bit_code);
+        if line_k[pos].saturating_sub(k) <= 1 {
+          if k >= 15 {
+            k = 15;
           }
         } else {
-          p.rice.set_k(p.rice.k() + 1);
+          k += 1;
         }
       } else {
-        if p.rice.bitstream_get_bits(1)? == 1 {
+        if pump.read_bits(1)? == 1 {
           debug_assert!(remaining != 1);
-          let n_syms = self.symbol_run_count(p, remaining)?;
+          let n_syms = self.symbol_run_count_at(&mut pump, s_param, remaining)?;
 
           remaining = remaining.saturating_sub(n_syms);
           // copy symbol n_syms times
           for _ in 0..n_syms {
             // For the first line, run-length coding uses only the symbol
             // value 0, so we can fill the line buffer and K buffer with 0.
-            p.line_buf[1][p.line_pos] = 0;
-            p.line_k[p.line_pos - 1] = 0;
-            p.line_pos += 1;
+            current[pos] = 0;
+            line_k[pos - 1] = 0;
+            pos += 1;
           }
         } // if bitstream == 1
 
         if remaining <= 1 {
           if remaining == 1 {
-            let bit_code = p.rice.adaptive_rice_decode(true, PREDICT_K_ESCAPE, PREDICT_K_ESCBITS, PREDICT_K_MAX)?;
-            p.line_buf[1][p.line_pos] = error_code_signed(bit_code + 1);
-            p.line_k[p.line_pos - 1] = p.rice.k();
-            p.line_pos += 1;
+            let bit_code = crate::decompressors::crx::rice::adaptive_rice_decode(&mut pump, &mut k, true, PREDICT_K_ESCAPE, PREDICT_K_ESCBITS, PREDICT_K_MAX)?;
+            current[pos] = error_code_signed(bit_code + 1);
+            line_k[pos - 1] = k;
+            pos += 1;
             remaining = remaining.saturating_sub(1); // skip remaining check at end of function
           }
           break;
         } else {
-          let bit_code = p.rice.adaptive_rice_decode(true, PREDICT_K_ESCAPE, PREDICT_K_ESCBITS, 0)?;
-          p.line_buf[1][p.line_pos] = error_code_signed(bit_code + 1); // Caution: + 1
-          if p.line_k[p.line_pos].saturating_sub(p.rice.k()) <= 1 {
-            if p.rice.k() >= 15 {
-              p.rice.set_k(15);
+          let bit_code = crate::decompressors::crx::rice::adaptive_rice_decode(&mut pump, &mut k, true, PREDICT_K_ESCAPE, PREDICT_K_ESCBITS, 0)?;
+          current[pos] = error_code_signed(bit_code + 1); // Caution: + 1
+          if line_k[pos].saturating_sub(k) <= 1 {
+            if k >= 15 {
+              k = 15;
             }
           } else {
-            p.rice.set_k(p.rice.k() + 1);
+            k += 1;
           }
         }
       }
-      p.line_k[p.line_pos - 1] = p.rice.k();
-      p.line_pos += 1;
+      line_k[pos - 1] = k;
+      pos += 1;
       remaining = remaining.saturating_sub(1);
     }
     // Remaining pixel?
     if remaining == 1 {
-      let bit_code = p.rice.adaptive_rice_decode(true, PREDICT_K_ESCAPE, PREDICT_K_ESCBITS, PREDICT_K_MAX)?;
-      p.line_buf[1][p.line_pos] = error_code_signed(bit_code);
-      p.line_k[p.line_pos - 1] = p.rice.k();
-      p.line_pos += 1;
+      let bit_code = crate::decompressors::crx::rice::adaptive_rice_decode(&mut pump, &mut k, true, PREDICT_K_ESCAPE, PREDICT_K_ESCBITS, PREDICT_K_MAX)?;
+      current[pos] = error_code_signed(bit_code);
+      line_k[pos - 1] = k;
+      pos += 1;
     }
-    debug_assert!(p.line_pos < p.line_buf[1].len());
+    debug_assert!(pos < current.len());
+    *line_pos = pos;
+    rice.rejoin(pump, k);
     Ok(())
   }
 
@@ -622,6 +742,7 @@ impl CodecParams {
 }
 
 /// Constrain a given value into min/max
+#[inline(always)]
 pub(super) fn constrain(value: i32, min: i32, max: i32) -> i32 {
   std::cmp::min(std::cmp::max(value, min), max)
   /*
@@ -643,6 +764,7 @@ pub(super) fn constrain(value: i32, min: i32, max: i32) -> i32 {
 /// signed integer value.
 /// For this, the sign bit is inverted and XOR with
 /// the shifted integer value.
+#[inline(always)]
 pub(super) fn error_code_signed(bit_code: u32) -> i32 {
   -((bit_code & 1) as i32) ^ (bit_code >> 1) as i32
 }
@@ -650,6 +772,7 @@ pub(super) fn error_code_signed(bit_code: u32) -> i32 {
 /// Median Edge Detection
 /// [0053] Obtains a predictive value p of the coefficient by using
 /// MED prediction, thereby performing predictive coding.
+#[inline(always)]
 pub(super) fn med(a: i32, b: i32, c: i32) -> i32 {
   if c >= std::cmp::max(a, b) {
     std::cmp::min(a, b)
@@ -706,6 +829,53 @@ fn convert_plane_line(codec: &CodecParams, l0: &[i32], l1: &[i32], l2: &[i32], l
   }
 
   Ok((p0, p1, p2, p3))
+}
+
+/// One plane row of all four planes, converted and written straight into the two CFA rows it
+/// occupies.
+///
+/// **This is the whole assembly stage for a single-tile image, and it exists to be run per row
+/// on its own thread.** `convert_plane_line` + `integrate_cfa` do the same work with four `Vec`
+/// allocations per row and four stride-2 passes over the same pair of output rows; this takes
+/// one pass, allocates nothing, and writes each row front to back. The four samples of a Bayer
+/// quad are adjacent in the output, so computing them together is also what lets them be stored
+/// together.
+#[inline]
+fn convert_rows_into_cfa(codec: &CodecParams, rows: &mut [u16], width: usize, l0: &[i32], l1: &[i32], l2: &[i32], l3: &[i32]) -> Result<()> {
+  let (top, bottom) = rows.split_at_mut(width);
+  let median_bits = codec.median_bits;
+  let max_val: i32 = (1 << median_bits) - 1;
+
+  match codec.enc_type {
+    0 => {
+      let median: i32 = 1 << (median_bits - 1);
+      for (i, (v0, v1, v2, v3)) in izip!(l0, l1, l2, l3).enumerate() {
+        top[2 * i] = constrain(median + v0, 0, max_val) as u16;
+        top[2 * i + 1] = constrain(median + v1, 0, max_val) as u16;
+        bottom[2 * i] = constrain(median + v2, 0, max_val) as u16;
+        bottom[2 * i + 1] = constrain(median + v3, 0, max_val) as u16;
+      }
+    }
+    3 => {
+      let median: i32 = 1 << (median_bits - 1) << 10;
+      for (i, (v0, v1, v2, v3)) in izip!(l0, l1, l2, l3).enumerate() {
+        let mut gr: i32 = median + (v0 << 10) - 168 * v1 - 585 * v3;
+        if gr < 0 {
+          gr = -(((gr.abs() + 512) >> 9) & !1);
+        } else {
+          gr = ((gr.abs() + 512) >> 9) & !1;
+        }
+        top[2 * i] = constrain((median + (v0 << 10) + 1510 * v3 + 512) >> 10, 0, max_val) as u16;
+        top[2 * i + 1] = constrain((v2 + gr + 1) >> 1, 0, max_val) as u16;
+        bottom[2 * i] = constrain((gr - v2 + 1) >> 1, 0, max_val) as u16;
+        bottom[2 * i + 1] = constrain((median + (v0 << 10) + 1927 * v1 + 512) >> 10, 0, max_val) as u16;
+      }
+    }
+    enc_type => {
+      return Err(CrxError::General(format!("Unsupported encoding type {}", enc_type)));
+    }
+  }
+  Ok(())
 }
 
 /// Integrate a plane buffer into CFA output image
