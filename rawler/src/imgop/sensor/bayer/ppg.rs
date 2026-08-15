@@ -3,7 +3,29 @@
 
 use multiversion::multiversion;
 use rayon::prelude::*;
-use std::{ops::Add, time::Instant};
+use std::ops::Add;
+
+// LOCAL PATCH (bowerbird), the same one `decompressors/crx/decoder.rs` carries. Upstream times
+// this demosaic with `std::time::Instant`, which wasm32-unknown-unknown has no clock for:
+// `Instant::now()` panics with "time not implemented on this platform". PPG is what a browser
+// with no WebGPU falls back to, so that panic is the whole fallback. The timing is a debug log
+// line, so on wasm it reports zero rather than bringing the demosaic down.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+struct Instant;
+
+#[cfg(target_arch = "wasm32")]
+impl Instant {
+  fn now() -> Self {
+    Self
+  }
+
+  fn elapsed(&self) -> std::time::Duration {
+    std::time::Duration::ZERO
+  }
+}
 
 use crate::{
   cfa::{CFA, CFA_COLOR_B, CFA_COLOR_G, CFA_COLOR_R, PlaneColor},
