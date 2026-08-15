@@ -1,5 +1,6 @@
 use std::cmp;
 use std::io::Cursor;
+use std::ops::RangeInclusive;
 
 use image::DynamicImage;
 use log::debug;
@@ -196,28 +197,7 @@ impl<'a> Decoder for ArwDecoder<'a> {
       _ => return Err(RawlerError::DecoderFailed(format!("ARW: Don't know how to decode type {}", compression))),
     };
 
-    let blacklevel = black
-      .map(|black| match cpp {
-        1 => Ok(BlackLevel::new(&black, self.camera.cfa.width, self.camera.cfa.height, cpp)),
-        // For YUV data, the blacklevel needs to be multiplicated by 2
-        3 => Ok(BlackLevel::new(&[black[0] * 2, black[0] * 2, black[0] * 2], 1, 1, cpp)),
-        _ => Err(RawlerError::DecoderFailed(format!("ARW: Unsupported cpp: {}", cpp))),
-      })
-      .transpose()?;
-    let whitelevel = white.map(|white| WhiteLevel(vec![white as u32; cpp]));
-
-    let photometric = match cpp {
-      1 => RawPhotometricInterpretation::Cfa(CFAConfig::new_from_camera(&self.camera)),
-      3 => RawPhotometricInterpretation::LinearRaw,
-      _ => return Err(RawlerError::DecoderFailed(format!("ARW: Unsupported cpp: {}", cpp))),
-    };
-
-    let mut img = RawImage::new(self.camera.clone(), image, cpp, params.wb, photometric, blacklevel, whitelevel, dummy);
-
-    if cpp == 3 {
-      // For debayer images, we assume WB coeffs already applied
-      img.wb_coeffs = [1.0, 1.0, 1.0, f32::NAN];
-    }
+    let mut img = self.raw_image_from(image, cpp, white, black, params.wb, dummy)?;
 
     if let Some(raw_image_size) = self.get_raw_image_size(raw)? {
       log::debug!("Found SONYRAWIMAGESIZE tag, using as active_area");
@@ -231,6 +211,29 @@ impl<'a> Decoder for ArwDecoder<'a> {
     log::debug!("crop_area: {:?}", img.crop_area);
     log::debug!("active_area: {:?}", img.active_area);
     Ok(img)
+  }
+
+  fn raw_image_region_tight(&self, file: &RawSource, params: &RawDecodeParams, region: Rect, dummy: bool) -> Result<(RawImage, Rect)> {
+    let Some(raw) = self.tiled_ljpeg() else {
+      let mut image = self.raw_image_region(file, params, region, dummy)?;
+      let whole = Rect::new(Point::zero(), Dim2::new(image.width, image.height));
+      super::forget_geometry(&mut image);
+      return Ok((image, whole));
+    };
+    let (image, decoded) = ArwDecoder::decode_ljpeg_region_tight(&self.camera, file, raw, region, dummy)?;
+    let levels = self.get_params(file)?;
+    let mut img = self.raw_image_from(image, 1, levels.whitelevel.map(|x| x[0]), levels.blacklevel, levels.wb, dummy)?;
+    super::forget_geometry(&mut img);
+    Ok((img, decoded))
+  }
+
+  fn raw_image_band_height(&self, _file: &RawSource, _params: &RawDecodeParams) -> Result<Option<usize>> {
+    Ok(
+      self
+        .tiled_ljpeg()
+        .and_then(|raw| raw.get_entry(TiffCommonTag::TileLength))
+        .map(|entry| entry.force_usize(0)),
+    )
   }
 
   /// Return the embedded JPEG preview
@@ -284,6 +287,39 @@ impl<'a> Decoder for ArwDecoder<'a> {
 }
 
 impl<'a> ArwDecoder<'a> {
+  /// The raw IFD, where it holds a bayer frame in independently addressable LJPEG tiles.
+  fn tiled_ljpeg(&self) -> Option<&IFD> {
+    let raw = *self.tiff.find_ifds_with_tag(TiffCommonTag::StripOffsets).first()?;
+    (raw.get_entry(TiffCommonTag::Compression)?.force_u32(0) == 7 && raw.get_entry(TiffCommonTag::SamplesPerPixel)?.force_usize(0) == 1)
+      .then_some(raw)
+  }
+
+  /// The levels and photometry of the frame, wrapped around samples already decoded from it.
+  fn raw_image_from(&self, image: PixU16, cpp: usize, white: Option<u16>, black: Option<[u16; 4]>, wb: [f32; 4], dummy: bool) -> Result<RawImage> {
+    let blacklevel = black
+      .map(|black| match cpp {
+        1 => Ok(BlackLevel::new(&black, self.camera.cfa.width, self.camera.cfa.height, cpp)),
+        // For YUV data, the blacklevel needs to be multiplicated by 2
+        3 => Ok(BlackLevel::new(&[black[0] * 2, black[0] * 2, black[0] * 2], 1, 1, cpp)),
+        _ => Err(RawlerError::DecoderFailed(format!("ARW: Unsupported cpp: {}", cpp))),
+      })
+      .transpose()?;
+    let whitelevel = white.map(|white| WhiteLevel(vec![white as u32; cpp]));
+
+    let photometric = match cpp {
+      1 => RawPhotometricInterpretation::Cfa(CFAConfig::new_from_camera(&self.camera)),
+      3 => RawPhotometricInterpretation::LinearRaw,
+      _ => return Err(RawlerError::DecoderFailed(format!("ARW: Unsupported cpp: {}", cpp))),
+    };
+
+    let mut img = RawImage::new(self.camera.clone(), image, cpp, wb, photometric, blacklevel, whitelevel, dummy);
+    if cpp == 3 {
+      // For debayer images, we assume WB coeffs already applied
+      img.wb_coeffs = [1.0, 1.0, 1.0, f32::NAN];
+    }
+    Ok(img)
+  }
+
   fn get_exif(&self) -> Result<&IFD> {
     self
       .tiff
@@ -410,7 +446,7 @@ impl<'a> ArwDecoder<'a> {
     let image = if dummy {
       PixU16::new_uninit(width, height)
     } else {
-      let buffer = file.as_vec()?;
+      let buffer = file.buf();
       let len = width * height * 2;
 
       // Constants taken from dcraw
@@ -420,12 +456,12 @@ impl<'a> ArwDecoder<'a> {
 
       // Replicate the dcraw contortions to get the "decryption" key
       let offset = (buffer[key_off] as usize) * 4;
-      let first_key = BEu32(&buffer, key_off + offset);
-      let head = ArwDecoder::sony_decrypt(&buffer, head_off, 40, first_key)?;
+      let first_key = BEu32(buffer, key_off + offset);
+      let head = ArwDecoder::sony_decrypt(buffer, head_off, 40, first_key)?;
       let second_key = LEu32(&head, 22);
 
       // "Decrypt" the whole image buffer
-      let image_data = ArwDecoder::sony_decrypt(&buffer, off, len, second_key)?;
+      let image_data = ArwDecoder::sony_decrypt(buffer, off, len, second_key)?;
       decompress_16be(&image_data, width, height, dummy)?
     };
     let cpp = 1;
@@ -534,7 +570,7 @@ impl<'a> ArwDecoder<'a> {
         format!("ARW LJPEG: trying to decode {} tiles from {} offsets", coltiles * rowtiles, offsets.count()),
       ));
     }
-    let buffer = file.as_vec()?;
+    let buffer = file.buf();
 
     if cpp == 3 {
       let mut image = decompress_strips_fn(
@@ -629,76 +665,40 @@ impl<'a> ArwDecoder<'a> {
   ///
   /// The output keeps the full frame's dimensions so its coordinates stay the file's own; the
   /// caller crops. Whole tiles are decoded, so what comes back is valid over the tile-aligned
-  /// rectangle containing `region`, not just over `region`.
+  /// rectangle containing `region`, not just over `region`. `decode_ljpeg_region_tight` answers the
+  /// same question in a buffer the size of that rectangle.
   pub(crate) fn decode_ljpeg_region(camera: &Camera, file: &RawSource, raw: &IFD, region: Rect, dummy: bool) -> Result<PixU16> {
-    let offsets = raw.get_entry(TiffCommonTag::TileOffsets).ok_or("Unable to find TileOffsets")?;
-    let width = fetch_tiff_tag!(raw, TiffCommonTag::ImageWidth).force_usize(0);
-    let height = fetch_tiff_tag!(raw, TiffCommonTag::ImageLength).force_usize(0);
-    let twidth = fetch_tiff_tag!(raw, TiffCommonTag::TileWidth).force_usize(0);
-    let tlength = fetch_tiff_tag!(raw, TiffCommonTag::TileLength).force_usize(0);
-    let cpp = fetch_tiff_tag!(raw, TiffCommonTag::SamplesPerPixel).force_usize(0);
-    let coltiles = (width - 1) / twidth + 1;
-    let rowtiles = (height - 1) / tlength + 1;
+    let tiles = ArwTiles::read(camera, raw)?;
+    let (cols, rows) = tiles.touched(region)?;
 
-    if cpp != 1 {
-      return Err(RawlerError::unsupported(camera, format!("ARW LJPEG region: unsupported cpp: {}", cpp)));
-    }
-    if coltiles * rowtiles != offsets.count() as usize {
-      return Err(RawlerError::unsupported(
-        camera,
-        format!("ARW LJPEG: trying to decode {} tiles from {} offsets", coltiles * rowtiles, offsets.count()),
-      ));
-    }
-
-    // The tiles the region touches, as half-open ranges over the tile grid.
-    let first_col = region.p.x / twidth;
-    let last_col = ((region.p.x + region.d.w).saturating_sub(1) / twidth).min(coltiles - 1);
-    let first_row = region.p.y / tlength;
-    let last_row = ((region.p.y + region.d.h).saturating_sub(1) / tlength).min(rowtiles - 1);
-    if first_col >= coltiles || first_row >= rowtiles {
-      return Err(RawlerError::DecoderFailed(format!("ARW LJPEG region {:?} is outside the {}x{} frame", region, width, height)));
-    }
-
-    // Borrowed, not `as_vec`: the source is already resident, and copying it out costs more than
-    // decoding the handful of tiles a crop wants.
-    let buffer = file.buf();
-    let mut out: PixU16 = alloc_image_ok!(width, height, dummy);
-
-    // One strip per tile row, so a strip's rows belong to it alone and the wanted ones can be
-    // handed out to threads without overlapping.
-    out
-      .pixels_mut()
-      .par_chunks_mut(width * tlength)
-      .enumerate()
-      .filter(|(row, _)| *row >= first_row && *row <= last_row)
-      .try_for_each(|(row, lines)| -> std::result::Result<(), String> {
-        for col in first_col..=last_col {
-          let offset = offsets.force_usize(row * coltiles + col);
-          let src = &buffer[offset..];
-          let decompressor = LjpegDecompressor::new(src)?;
-          // A 512x512 bayer tile arrives as 256x256 of four components, one per CFA position.
-          let (w, h, cpp) = (256, 256, 4);
-          let mut data = vec![0; h * w * cpp];
-          decompressor.decode(&mut data, 0, w * cpp, w * cpp, h, dummy)?;
-
-          let mut strip = &mut *lines;
-          for line in data.chunks_exact(w * cpp) {
-            for (i, chunk) in line.chunks_exact(4).enumerate() {
-              // Unpack chunks of RGGB pixel data into two output lines
-              // so the first line is RGRGRG and the second one is GBGBGB.
-              strip[col * twidth + i * 2] = chunk[0];
-              strip[col * twidth + i * 2 + 1] = chunk[1];
-              strip[width + col * twidth + i * 2] = chunk[2];
-              strip[width + col * twidth + i * 2 + 1] = chunk[3];
-            }
-            // Now move output strip by two rows.
-            strip = &mut strip[width * 2..];
-          }
-        }
-        Ok(())
-      })
+    let mut out: PixU16 = alloc_image_ok!(tiles.width, tiles.height, dummy);
+    let band = tiles.width * tiles.tlength;
+    let pixels = &mut out.pixels_mut()[rows.start() * band..(rows.end() + 1) * band];
+    tiles
+      .decode_into(file.buf(), &cols, &rows, 0, tiles.width, pixels, dummy)
       .map_err(RawlerError::DecoderFailed)?;
     Ok(out)
+  }
+
+  /// As `decode_ljpeg_region`, but allocating the touched tiles alone.
+  ///
+  /// Hands back the tile-aligned rectangle it decoded, in the frame's coordinates.
+  pub(crate) fn decode_ljpeg_region_tight(camera: &Camera, file: &RawSource, raw: &IFD, region: Rect, dummy: bool) -> Result<(PixU16, Rect)> {
+    let tiles = ArwTiles::read(camera, raw)?;
+    let (cols, rows) = tiles.touched(region)?;
+    let decoded = Rect::new(
+      Point::new(cols.start() * tiles.twidth, rows.start() * tiles.tlength),
+      Dim2::new((cols.end() + 1 - cols.start()) * tiles.twidth, (rows.end() + 1 - rows.start()) * tiles.tlength),
+    );
+
+    if dummy {
+      return Ok((PixU16::new_uninit(decoded.d.w, decoded.d.h), decoded));
+    }
+    let mut out = PixU16::new(decoded.d.w, decoded.d.h);
+    tiles
+      .decode_into(file.buf(), &cols, &rows, *cols.start(), decoded.d.w, out.pixels_mut(), dummy)
+      .map_err(RawlerError::DecoderFailed)?;
+    Ok((out, decoded))
   }
 
   /// The white balance and levels, decrypted once per decoder.
@@ -731,8 +731,9 @@ impl<'a> ArwDecoder<'a> {
       let tag = fetch_tiff_tag!(priv_tiff, TiffCommonTag::SonyKey).get_data();
       LEu32(tag, 0)
     };
-    let buffer = file.as_vec()?;
-    let decrypted_buf = ArwDecoder::sony_decrypt(&buffer, sony_offset as usize, sony_length, sony_key)?;
+    // Borrowed, not `as_vec`: `sony_decrypt` reads one block of a few kilobytes, and copying the
+    // whole file out to reach it cost more resident memory than decoding the frame does.
+    let decrypted_buf = ArwDecoder::sony_decrypt(file.buf(), sony_offset as usize, sony_length, sony_key)?;
 
     let decrypted_tiff = IFD::new(&mut Cursor::new(decrypted_buf), 0, 0, -(sony_offset as i32), Endian::Little, &[])?;
 
@@ -918,6 +919,124 @@ fn sony_tag9cxx_decipher(data: &[u8]) -> Vec<u8> {
   let mut buf = Vec::from(data);
   buf.iter_mut().for_each(|v| *v = SONY_TAG_940X_DECIPHER_TABLE[*v as usize]);
   buf
+}
+
+/// The LJPEG tile grid of a tiled ARW, as the raw IFD describes it.
+struct ArwTiles<'a> {
+  offsets: &'a Entry,
+  width: usize,
+  height: usize,
+  twidth: usize,
+  tlength: usize,
+  coltiles: usize,
+  rowtiles: usize,
+}
+
+impl<'a> ArwTiles<'a> {
+  fn read(camera: &Camera, raw: &'a IFD) -> Result<Self> {
+    let offsets = raw.get_entry(TiffCommonTag::TileOffsets).ok_or("Unable to find TileOffsets")?;
+    let width = fetch_tiff_tag!(raw, TiffCommonTag::ImageWidth).force_usize(0);
+    let height = fetch_tiff_tag!(raw, TiffCommonTag::ImageLength).force_usize(0);
+    let twidth = fetch_tiff_tag!(raw, TiffCommonTag::TileWidth).force_usize(0);
+    let tlength = fetch_tiff_tag!(raw, TiffCommonTag::TileLength).force_usize(0);
+    let cpp = fetch_tiff_tag!(raw, TiffCommonTag::SamplesPerPixel).force_usize(0);
+
+    if cpp != 1 {
+      return Err(RawlerError::unsupported(camera, format!("ARW LJPEG region: unsupported cpp: {}", cpp)));
+    }
+    // The unpack below writes a whole 512x512 tile per grid cell, so a frame that is not a whole
+    // number of tiles would have its last row and column write over their neighbours.
+    if twidth != 512 || tlength != 512 || width % twidth != 0 || height % tlength != 0 {
+      return Err(RawlerError::unsupported(
+        camera,
+        format!("ARW LJPEG: {}x{} frame does not tile into {}x{}", width, height, twidth, tlength),
+      ));
+    }
+    let coltiles = width / twidth;
+    let rowtiles = height / tlength;
+    if coltiles * rowtiles != offsets.count() as usize {
+      return Err(RawlerError::unsupported(
+        camera,
+        format!("ARW LJPEG: trying to decode {} tiles from {} offsets", coltiles * rowtiles, offsets.count()),
+      ));
+    }
+    Ok(Self {
+      offsets,
+      width,
+      height,
+      twidth,
+      tlength,
+      coltiles,
+      rowtiles,
+    })
+  }
+
+  /// The grid cells `region` overlaps, as inclusive ranges of tile column and tile row.
+  fn touched(&self, region: Rect) -> Result<(RangeInclusive<usize>, RangeInclusive<usize>)> {
+    let first_col = region.p.x / self.twidth;
+    let last_col = ((region.p.x + region.d.w).saturating_sub(1) / self.twidth).min(self.coltiles - 1);
+    let first_row = region.p.y / self.tlength;
+    let last_row = ((region.p.y + region.d.h).saturating_sub(1) / self.tlength).min(self.rowtiles - 1);
+    if first_col >= self.coltiles || first_row >= self.rowtiles {
+      return Err(RawlerError::DecoderFailed(format!(
+        "ARW LJPEG region {:?} is outside the {}x{} frame",
+        region, self.width, self.height
+      )));
+    }
+    Ok((first_col..=last_col, first_row..=last_row))
+  }
+
+  /// Decodes the grid cells `cols` x `rows` into `out`, which is `rows` bands of `stride` samples
+  /// with tile column `col_origin` at its left edge.
+  fn decode_into(
+    &self,
+    buffer: &[u8],
+    cols: &RangeInclusive<usize>,
+    rows: &RangeInclusive<usize>,
+    col_origin: usize,
+    stride: usize,
+    out: &mut [u16],
+    dummy: bool,
+  ) -> std::result::Result<(), String> {
+    let ncols = cols.end() + 1 - cols.start();
+    let left = (cols.start() - col_origin) * self.twidth;
+
+    // Each tile owns 512 rows of 512 samples, which is neither contiguous in `out` nor splittable
+    // out of it by `par_chunks_mut`. Handing every tile its own rows up front makes them disjoint
+    // borrows, so the whole grid decodes in parallel rather than one tile row at a time - a band is
+    // a single tile row, and decoding one serially would cost the strip path all its threads.
+    let mut tiles: Vec<Vec<&mut [u16]>> = (0..ncols * (rows.end() + 1 - rows.start())).map(|_| Vec::with_capacity(self.tlength)).collect();
+    for (row, band) in out.chunks_mut(stride * self.tlength).enumerate() {
+      for line in band.chunks_mut(stride) {
+        for (col, piece) in line[left..left + ncols * self.twidth].chunks_mut(self.twidth).enumerate() {
+          tiles[row * ncols + col].push(piece);
+        }
+      }
+    }
+
+    tiles.into_par_iter().enumerate().try_for_each(|(i, mut lines)| {
+      let (row, col) = (rows.start() + i / ncols, cols.start() + i % ncols);
+      let decompressor = LjpegDecompressor::new(&buffer[self.offsets.force_usize(row * self.coltiles + col)..])?;
+      // A 512x512 bayer tile arrives as 256x256 of four components, one per CFA position.
+      let (w, h, cpp) = (256, 256, 4);
+      let mut data = vec![0; h * w * cpp];
+      decompressor.decode(&mut data, 0, w * cpp, w * cpp, h, dummy)?;
+
+      for (y, line) in data.chunks_exact(w * cpp).enumerate() {
+        let (above, below) = lines.split_at_mut(y * 2 + 1);
+        let (top, bottom) = (&mut above[y * 2], &mut below[0]);
+        for (i, chunk) in line.chunks_exact(4).enumerate() {
+          // Unpack chunks of RGGB pixel data into two output lines
+          // so the first line is RGRGRG and the second one is GBGBGB.
+          top[i * 2] = chunk[0];
+          top[i * 2 + 1] = chunk[1];
+          bottom[i * 2] = chunk[2];
+          bottom[i * 2 + 1] = chunk[3];
+        }
+      }
+      Ok(())
+    })
+  }
 }
 
 #[derive(Debug, Clone)]

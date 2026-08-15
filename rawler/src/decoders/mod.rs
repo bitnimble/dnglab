@@ -327,6 +327,16 @@ impl RawMetadata {
   }
 }
 
+/// Drops the rectangles a `raw_image_region_tight` result cannot honestly carry.
+///
+/// `RawImage::new` derives them from the camera against whatever dimensions it was handed, so a
+/// region-sized image comes back claiming an active area and a crop inside the region.
+pub fn forget_geometry(image: &mut RawImage) {
+  image.active_area = None;
+  image.crop_area = None;
+  image.blackareas.clear();
+}
+
 pub trait Decoder: Send {
   fn raw_image(&self, file: &RawSource, params: &RawDecodeParams, dummy: bool) -> Result<RawImage>;
 
@@ -341,6 +351,41 @@ pub trait Decoder: Send {
   /// structure has to do anyway.
   fn raw_image_region(&self, file: &RawSource, params: &RawDecodeParams, _region: Rect, dummy: bool) -> Result<RawImage> {
     self.raw_image(file, params, dummy)
+  }
+
+  /// As `raw_image_region`, but allocating only what it decodes.
+  ///
+  /// `raw_image_region` keeps the frame's dimensions, so a loupe tile of a few megabytes is carried
+  /// back inside a frame-sized buffer - 122MB on a 61MP ARW - and lifted out of it row by row. This
+  /// hands back an image that is the pieces it decoded and nothing else, with the rectangle those
+  /// pieces cover: the image's `width`/`height` are that rectangle's and its first sample is that
+  /// rectangle's top left.
+  ///
+  /// The rectangle is generally *larger* than `region` - a piece is decoded whole - and it is
+  /// returned rather than assumed for exactly that reason.
+  ///
+  /// Every rectangle the image itself carries is cleared, because none of them survives a change of
+  /// coordinates: a caller wanting the frame's geometry asks `raw_image` for it with `dummy`, which
+  /// decodes nothing. The levels, the white balance and the photometry are the frame's and stay.
+  ///
+  /// The default decodes the frame and reports the frame, which is correct and saves nothing.
+  fn raw_image_region_tight(&self, file: &RawSource, params: &RawDecodeParams, region: Rect, dummy: bool) -> Result<(RawImage, Rect)> {
+    let mut image = self.raw_image_region(file, params, region, dummy)?;
+    let whole = Rect::new(Point::zero(), Dim2::new(image.width, image.height));
+    forget_geometry(&mut image);
+    Ok((image, whole))
+  }
+
+  /// The rows a decode produces as a unit, where it has a grain finer than the frame.
+  ///
+  /// A caller that wants the whole frame without ever holding it asks `raw_image_region_tight` for
+  /// full-width regions this tall in turn, and peak becomes the file plus one band. Asking for any
+  /// other height decodes whole bands regardless, so it would only pay for the same samples twice.
+  ///
+  /// `None` where the format has no such grain, which is also what a decoder that has not
+  /// specialised the tight path should say - one band would be one frame.
+  fn raw_image_band_height(&self, _file: &RawSource, _params: &RawDecodeParams) -> Result<Option<usize>> {
+    Ok(None)
   }
 
   fn raw_image_count(&self) -> Result<usize> {
