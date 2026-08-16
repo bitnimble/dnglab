@@ -9,7 +9,7 @@ use std::fmt::Debug;
 
 use crate::bits::Endian;
 use crate::decoders::*;
-use crate::decompressors::crx::decompress_crx_image;
+use crate::decompressors::crx::{decompress_crx_image, decompress_crx_image_rows};
 use crate::envparams::{rawler_crx_raw_trak, rawler_ignore_previews};
 use crate::exif::ExifGPS;
 use crate::formats::bmff::FileBox;
@@ -19,7 +19,7 @@ use crate::formats::bmff::ext_cr3::iad1::{Iad1Box, Iad1Type};
 use crate::formats::bmff::trak::TrakBox;
 use crate::formats::tiff::reader::TiffReader;
 use crate::formats::tiff::{Entry, GenericTiffReader, Rational, Value};
-use crate::imgop::{Point, Rect};
+use crate::imgop::{Dim2, Point, Rect};
 use crate::lens::{LensDescription, LensId, LensResolver};
 use crate::{RawImage, pumps::ByteStream};
 
@@ -82,6 +82,29 @@ enum Cr3ImageType {
 }
 
 impl<'a> Cr3Decoder<'a> {
+  /// The compressed samples for an image index, and the CMP1 box describing them.
+  ///
+  /// LOCAL PATCH (bowerbird). `raw_image` finds these inline; the region decode needs the same two
+  /// and nothing else it does, so they are reachable on their own rather than by running a whole
+  /// decode to get at them.
+  fn crx_data(&self, file: &'a RawSource, params: &RawDecodeParams) -> Result<(&'a [u8], &Cmp1Box)> {
+    let raw_trak_id = rawler_crx_raw_trak()
+      .or_else(|| self.get_trak_index(Cr3ImageType::CrxBix))
+      .ok_or("Unable to find trak index")?;
+    let moov_trak = self.moov_trak(raw_trak_id).ok_or(format!("Unable to get MOOV trak {}", raw_trak_id))?;
+    let (offset, size) = moov_trak
+      .mdia
+      .minf
+      .stbl
+      .get_sample_offset(params.image_index as u32 + 1)
+      .ok_or_else(|| RawlerError::DecoderFailed("stbl sample not found".to_string()))?;
+    let buf = file
+      .subview(offset as u64, size as u64)
+      .map_err(|e| RawlerError::with_io_error("CR3: failed to read raw data", file.path(), e))?;
+    let cmp1 = self.cmp1_box(raw_trak_id).ok_or(format!("CMP1 box not found for trak {}", raw_trak_id))?;
+    Ok((buf, cmp1))
+  }
+
   /// Construct new CR3 or CRM deocder
   pub fn new(_rawfile: &RawSource, bmff: Bmff, rawloader: &'a RawLoader) -> Result<Cr3Decoder<'a>> {
     if let Some(Cr3DescBox { cmt1, cmt2, cmt3, cmt4, .. }) = bmff.filebox.moov.cr3desc.as_ref() {
@@ -250,6 +273,46 @@ impl<'a> Decoder for Cr3Decoder<'a> {
       .ok_or("Unable to find trak index")?;
     let moov_trak = self.moov_trak(raw_trak_id).ok_or(format!("Unable to get MOOV trak {}", raw_trak_id))?;
     Ok(moov_trak.mdia.minf.stbl.stsz.sample_count as usize)
+  }
+
+  /// The rows a region needs, and nothing below them.
+  ///
+  /// **One-dimensional, because CRX is.** `CodecParams::decode_rows` says why: prediction reads
+  /// the line above and the 5/3 wavelet spans lines, so row N costs every row before it, and
+  /// Canon writes one tile for the whole frame so there is nothing to skip sideways. Stopping
+  /// early is what is left, and it is most of the win for a magnifier - a crop near the top costs
+  /// almost nothing, one halfway down costs half the decode.
+  ///
+  /// The rectangle handed back is therefore full width and starts at row zero: the truth about
+  /// what was decoded rather than a shape chosen to look tight. The caller crops it.
+  ///
+  /// A dummy decode carries every level, the active area and the crop without touching a sample,
+  /// so the frame's own description comes from `raw_image` rather than from a second copy of the
+  /// twenty lines that derive it.
+  fn raw_image_region_tight(
+    &self,
+    file: &RawSource,
+    params: &RawDecodeParams,
+    region: Rect,
+    dummy: bool,
+  ) -> Result<(RawImage, Rect)> {
+    let mut image = self.raw_image(file, params, true)?;
+    let width = image.width;
+    // Rounded up to a whole plane row, since each plane carries every other line of the frame.
+    let height = (((region.p.y + region.d.h).saturating_div(2) + 1) * 2).min(image.height);
+    let covered = Rect::new(Point::new(0, 0), Dim2::new(width, height));
+
+    if !dummy {
+      let (buf, cmp1) = self.crx_data(file, params)?;
+      let mut samples =
+        decompress_crx_image_rows(buf, cmp1, height.saturating_sub(1)).map_err(|e| format!("Failed to decode raw: {}", e))?;
+      samples.truncate(width * height);
+      image.data = RawImageData::Integer(samples);
+    }
+    image.width = width;
+    image.height = height;
+    super::forget_geometry(&mut image);
+    Ok((image, covered))
   }
 
   /// Decode raw image
