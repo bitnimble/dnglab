@@ -40,6 +40,30 @@ impl RawSource {
     })
   }
 
+  /// LOCAL PATCH (bowerbird). The same map as [`Self::new`] with nothing faulted in ahead of the
+  /// read, for a caller that wants a few kilobytes of a file rather than all of it.
+  ///
+  /// `new` asks for `MAP_POPULATE` and then advises `WillNeed`, and both of those read the *whole*
+  /// file: 25-90MB to answer a question about tags, or to lift a 10MB preview out of its own byte
+  /// range. That is the right trade for a decode, which goes on to touch every page, and the wrong
+  /// one for an import, which opens every file in a library through `header::read_path` and
+  /// `decode_rawler::upright_preview_jpeg`. Without this those two pull entire libraries through
+  /// the page cache to read a fraction of each file.
+  ///
+  /// Added beside `new` rather than given a flag, so upstream's function is untouched and this
+  /// replays over their changes.
+  pub fn new_lazy(path: &Path) -> std::io::Result<Self> {
+    let file = File::open(path)?;
+    // No `populate()`, and no advice either: `WillNeed` starts readahead over the entire mapping,
+    // which is the prefault this exists to avoid, and `Sequential` widens the window for a caller
+    // that is seeking to tag offsets. The kernel's own readahead is what should decide here.
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    Ok(Self {
+      path: path.canonicalize().unwrap_or_else(|_| path.to_owned()),
+      inner: RawSourceImpl::Memmap(mmap),
+    })
+  }
+
   pub fn new_from_shared_vec(buf: Arc<Vec<u8>>) -> Self {
     Self {
       path: PathBuf::default(),
