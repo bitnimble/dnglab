@@ -44,6 +44,10 @@ pub struct Exif {
   pub light_source: Option<u16>,
   pub flash: Option<u16>,
   pub focal_length: Option<Rational>,
+  /// LOCAL PATCH (bowerbird): the only reading of the sensor's physical size a RAW
+  /// offers across makers - `focal_length_in_35mm / focal_length` is the crop factor.
+  /// Without it `dust.rs` sizes a particle's shadow against a full frame on every body.
+  pub focal_length_in_35mm: Option<u16>,
   pub image_number: Option<u32>,
   pub color_space: Option<u16>,
   pub flash_energy: Option<Rational>,
@@ -151,6 +155,8 @@ impl Exif {
           (ExifTag::LightSource, Value::Short(data)) => self.light_source = data.get(0).cloned(),
           (ExifTag::Flash, Value::Short(data)) => self.flash = data.get(0).cloned(),
           (ExifTag::FocalLength, Value::Rational(data)) => self.focal_length = data.get(0).cloned(),
+          // LOCAL PATCH (bowerbird): see the field.
+          (ExifTag::FocalLengthIn35mmFormat, Value::Short(data)) => self.focal_length_in_35mm = data.get(0).cloned(),
           (ExifTag::ImageNumber, Value::Long(data)) => self.image_number = data.get(0).cloned(),
           (ExifTag::ColorSpace, Value::Short(data)) => self.color_space = data.get(0).cloned(),
           (ExifTag::FlashEnergy, Value::Rational(data)) => self.flash_energy = data.get(0).cloned(),
