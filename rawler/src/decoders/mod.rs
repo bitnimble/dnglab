@@ -425,6 +425,18 @@ pub trait Decoder: Send {
     Ok(None)
   }
 
+  /// LOCAL PATCH (bowerbird): every embedded JPEG, not just the one `preview_jpeg` picks.
+  ///
+  /// A body writes more than one and they are different renderings, so which one a caller wants
+  /// depends on what it is for. Undecoded and in file order: the caller reads each one's frame
+  /// header to size it, which is bytes rather than a decode.
+  ///
+  /// Defaults to `preview_jpeg`, so a decoder that has not been taught about the others is
+  /// unchanged.
+  fn preview_jpegs<'a>(&self, file: &'a RawSource, params: &RawDecodeParams) -> Result<Vec<&'a [u8]>> {
+    Ok(self.preview_jpeg(file, params)?.into_iter().collect())
+  }
+
   fn format_dump(&self) -> FormatDump;
 
   fn ifd(&self, _wk_ifd: WellKnownIFD) -> Result<Option<Rc<IFD>>> {

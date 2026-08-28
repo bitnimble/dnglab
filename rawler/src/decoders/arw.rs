@@ -248,22 +248,33 @@ impl<'a> Decoder for ArwDecoder<'a> {
     // rather than the root IFD's. Sony writes a 1616x1080 preview in IFD0 and the
     // full-size JPEG in a sub-IFD; a camera match fitted against the small one is
     // matching a different rendering than the JPEG the camera shows.
-    let mut best: Option<(u64, u64)> = None;
+    //
+    // The largest of what `preview_jpegs` finds, so the two cannot disagree about where the
+    // previews are - only about which of them a caller wants.
+    Ok(self.preview_jpegs(file, params)?.into_iter().max_by_key(|jpeg| jpeg.len()))
+  }
+
+  /// LOCAL PATCH (bowerbird): see the trait's own note. Every embedded JPEG this file names.
+  ///
+  /// One whose extent runs off the end of the file is dropped rather than failing the call, so a
+  /// truncated download still offers whichever previews are whole. `preview_jpeg` therefore hands
+  /// back the largest *readable* one where it used to hand back nothing.
+  fn preview_jpegs<'b>(&self, file: &'b RawSource, params: &RawDecodeParams) -> Result<Vec<&'b [u8]>> {
+    if params.image_index != 0 {
+      return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
     for ifd in self.tiff.find_ifds_with_tag(ExifTag::JPEGInterchangeFormat) {
       if let (Some(off), Some(len)) = (
         ifd.get_entry(ExifTag::JPEGInterchangeFormat),
         ifd.get_entry(ExifTag::JPEGInterchangeFormatLength),
       ) {
-        let (off, len) = (off.force_u64(0), len.force_u64(0));
-        if best.map_or(true, |(_, held)| len > held) {
-          best = Some((off, len));
+        if let Ok(jpeg) = file.subview(off.force_u64(0), len.force_u64(0)) {
+          found.push(jpeg);
         }
       }
     }
-    match best {
-      Some((off, len)) => Ok(file.subview(off, len).ok()),
-      None => Ok(None),
-    }
+    Ok(found)
   }
 
   fn preview_image(&self, file: &RawSource, params: &RawDecodeParams) -> Result<Option<DynamicImage>> {
