@@ -244,14 +244,26 @@ impl<'a> Decoder for ArwDecoder<'a> {
     if params.image_index != 0 {
       return Ok(None);
     }
-    let root = self.tiff.root_ifd();
-    let (Some(off), Some(len)) = (
-      root.get_entry(ExifTag::JPEGInterchangeFormat),
-      root.get_entry(ExifTag::JPEGInterchangeFormatLength),
-    ) else {
-      return Ok(None);
-    };
-    Ok(file.subview(off.force_u64(0), len.force_u64(0)).ok())
+    // LOCAL PATCH (bowerbird): the largest embedded JPEG, from whichever IFD holds it,
+    // rather than the root IFD's. Sony writes a 1616x1080 preview in IFD0 and the
+    // full-size JPEG in a sub-IFD; a camera match fitted against the small one is
+    // matching a different rendering than the JPEG the camera shows.
+    let mut best: Option<(u64, u64)> = None;
+    for ifd in self.tiff.find_ifds_with_tag(ExifTag::JPEGInterchangeFormat) {
+      if let (Some(off), Some(len)) = (
+        ifd.get_entry(ExifTag::JPEGInterchangeFormat),
+        ifd.get_entry(ExifTag::JPEGInterchangeFormatLength),
+      ) {
+        let (off, len) = (off.force_u64(0), len.force_u64(0));
+        if best.map_or(true, |(_, held)| len > held) {
+          best = Some((off, len));
+        }
+      }
+    }
+    match best {
+      Some((off, len)) => Ok(file.subview(off, len).ok()),
+      None => Ok(None),
+    }
   }
 
   fn preview_image(&self, file: &RawSource, params: &RawDecodeParams) -> Result<Option<DynamicImage>> {
