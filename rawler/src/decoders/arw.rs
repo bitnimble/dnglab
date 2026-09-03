@@ -246,8 +246,8 @@ impl<'a> Decoder for ArwDecoder<'a> {
     }
     // LOCAL PATCH (bowerbird): the largest embedded JPEG, from whichever IFD holds it,
     // rather than the root IFD's. Sony writes a 1616x1080 preview in IFD0 and the
-    // full-size JPEG in a sub-IFD; a camera match fitted against the small one is
-    // matching a different rendering than the JPEG the camera shows.
+    // full-size JPEG in a sub-IFD, and a viewer showing the body's own rendering wants
+    // the full one.
     //
     // The largest of what `preview_jpegs` finds, so the two cannot disagree about where the
     // previews are - only about which of them a caller wants.
