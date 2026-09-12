@@ -214,6 +214,12 @@ impl<'a> Decoder for ArwDecoder<'a> {
   }
 
   fn raw_image_region_tight(&self, file: &RawSource, params: &RawDecodeParams, region: Rect, dummy: bool) -> Result<(RawImage, Rect)> {
+    // LOCAL PATCH (bowerbird). ARW2 before the fall-through: it is a fixed-rate block code and a
+    // region of it is addressable by arithmetic alone, where without this arm a window of a 61MP
+    // frame decodes all 61MP and faults the whole file in to do it.
+    if let Some(raw) = self.block_arw2() {
+      return self.arw2_region_tight(file, raw, region, dummy);
+    }
     let Some(raw) = self.tiled_ljpeg() else {
       let mut image = self.raw_image_region(file, params, region, dummy)?;
       let whole = Rect::new(Point::zero(), Dim2::new(image.width, image.height));
@@ -315,6 +321,56 @@ impl<'a> ArwDecoder<'a> {
     let raw = *self.tiff.find_ifds_with_tag(TiffCommonTag::StripOffsets).first()?;
     (raw.get_entry(TiffCommonTag::Compression)?.force_u32(0) == 7 && raw.get_entry(TiffCommonTag::SamplesPerPixel)?.force_usize(0) == 1)
       .then_some(raw)
+  }
+
+  /// LOCAL PATCH (bowerbird). One region of an ARW2 frame, with its levels, as the tight region
+  /// decode wants it.
+  ///
+  /// Beside `raw_image_region_tight`'s LJPEG arm and doing the same job for the other addressable
+  /// format: decode the region, wrap it in the frame's own levels, and forget the geometry - the
+  /// rectangle is not the frame, so a crop or an active area stated against the frame would be
+  /// read against the wrong origin.
+  fn arw2_region_tight(&self, file: &RawSource, raw: &IFD, region: Rect, dummy: bool) -> Result<(RawImage, Rect)> {
+    let width = fetch_tiff_tag!(raw, TiffCommonTag::ImageWidth).force_usize(0);
+    let height = fetch_tiff_tag!(raw, TiffCommonTag::ImageLength).force_usize(0);
+    let offset = fetch_tiff_tag!(raw, TiffCommonTag::StripOffsets).force_usize(0);
+    let curve = ArwDecoder::get_curve(raw)?;
+    // `subview_until_eof` is a slice of the mapping rather than a copy, so the pages a region
+    // never indexes are pages a lazy mapping never faults in.
+    let src = file.subview_until_eof(offset as u64)?;
+    let (image, decoded) = ArwDecoder::decode_arw2_region(src, width, height, &curve, region, dummy)?;
+
+    let levels = self.get_params(file)?;
+    let mut img = self.raw_image_from(image, 1, levels.whitelevel.map(|x| x[0]), levels.blacklevel, levels.wb, dummy)?;
+    super::forget_geometry(&mut img);
+    Ok((img, decoded))
+  }
+
+  /// LOCAL PATCH (bowerbird). The frame's IFD where it is ARW2, which a region can be cut from.
+  ///
+  /// The sibling of `tiled_ljpeg`, and the same question for the other addressable format:
+  /// compression 32767 at 8 bits per sample is the fixed-rate block code `decode_arw2_region`
+  /// reads. ARW1 is not addressable - it carries a predictor down every column.
+  ///
+  /// **Compression and bits per sample do not tell those two apart, and the byte count does.**
+  /// ARW1 shares the compression number, and the A100's own camera entry forces `bps = 8` exactly
+  /// as every ARW2 body has - so the test `raw_image_region` actually dispatches on is whether the
+  /// strip holds `width * height * bps` bits, which ARW2 does by construction and ARW1 does not.
+  /// The predicate here is that one verbatim, because a file this claimed wrongly would be read as
+  /// a block code and come back as a picture of noise rather than as an error.
+  fn block_arw2(&self) -> Option<&IFD> {
+    let raw = *self.tiff.find_ifds_with_tag(TiffCommonTag::StripOffsets).first()?;
+    let bps = match &self.camera.bps {
+      Some(forced) => *forced,
+      None => raw.get_entry(TiffCommonTag::BitsPerSample)?.force_usize(0),
+    };
+    let width = raw.get_entry(TiffCommonTag::ImageWidth)?.force_usize(0);
+    let height = raw.get_entry(TiffCommonTag::ImageLength)?.force_usize(0);
+    let count = raw.get_entry(TiffCommonTag::StripByteCounts)?.force_usize(0);
+    let arw2 = raw.get_entry(TiffCommonTag::Compression)?.force_u32(0) == 32767
+      && bps == 8
+      && width.checked_mul(height).and_then(|pixels| pixels.checked_mul(bps)) == count.checked_mul(8);
+    arw2.then_some(raw)
   }
 
   /// The levels and photometry of the frame, wrapped around samples already decoded from it.
@@ -526,6 +582,114 @@ impl<'a> ArwDecoder<'a> {
 
   pub(crate) fn decode_arw6(buf: &[u8], width: usize, height: usize, curve: &LookupTable, dummy: bool) -> Result<PixU16> {
     decompress_arw6(buf, width, height, curve, dummy)
+  }
+
+  /// LOCAL PATCH (bowerbird). ARW2, decoding only the rows and columns `region` touches.
+  ///
+  /// **ARW2 is a fixed-rate block code, so a region of it is addressable arithmetically.** A row
+  /// starts at `row * width` bytes and each 32 output pixels take exactly 32 of them - two
+  /// sub-blocks of 11 + 11 + 4 + 4 + 14x7 bits, which is 128 bits for 16 pixels. Nothing carries
+  /// between blocks or rows: each one holds its own max, min and raw deltas, where ARW1 walks a
+  /// running predictor down every column and cannot be cut at all.
+  ///
+  /// So this reads `region`'s rows and, inside each, the 32-pixel chunks it covers, and hands back
+  /// the chunk-aligned rectangle it filled. Without it a window of a 61MP frame decodes the whole
+  /// 61MP and faults the whole file in to do it - and the editor now asks for a window per zoom.
+  ///
+  /// **Bit-identical to `decode_arw2` over the rectangle it returns**, which is the point and is
+  /// not free by accident. The dither carries a running seed down each row, so a chunk decoded
+  /// without the ones before it would dither differently and a tile would stop predicting the
+  /// render it exists to predict. `LookupTable::dither` advances that seed by
+  /// `15700 * (rand & 65535) + (rand >> 16)` - a function of the seed alone and not of the pixel -
+  /// so the skipped chunks are wound past arithmetically, 32 steps each, rather than decoded.
+  pub(crate) fn decode_arw2_region(
+    buf: &[u8],
+    width: usize,
+    height: usize,
+    curve: &LookupTable,
+    region: Rect,
+    dummy: bool,
+  ) -> Result<(PixU16, Rect)> {
+    /// Output pixels per block of the bitstream, and the bytes one takes.
+    const CHUNK: usize = 32;
+
+    // A span of nothing, refused before the arithmetic rounds it into something. `div_ceil` takes
+    // an empty width at an unaligned `x` up to the next chunk boundary, so without this a zero
+    // width comes back as a whole chunk of picture where a zero height errors - and a caller
+    // handed a chunk it did not ask for has no way to tell.
+    if region.d.w == 0 || region.d.h == 0 {
+      return Err(RawlerError::DecoderFailed(format!("ARW2 region {:?} is empty", region)));
+    }
+    // Saturating, so a caller's arithmetic cannot become this function's panic. Every caller today
+    // clamps the rectangle to the frame before it arrives, which is what makes this insurance
+    // rather than a check.
+    let first_col = (region.p.x / CHUNK).min(width / CHUNK);
+    let last_col = region.p.x.saturating_add(region.d.w).div_ceil(CHUNK).min(width / CHUNK);
+    let first_row = region.p.y.min(height);
+    let last_row = region.p.y.saturating_add(region.d.h).min(height);
+    if last_col <= first_col || last_row <= first_row {
+      return Err(RawlerError::DecoderFailed(format!(
+        "ARW2 region {:?} is outside the {}x{} frame",
+        region, width, height
+      )));
+    }
+    // **Refused rather than indexed, because the rows below index this directly.** One pixel is
+    // one byte, so the last byte any row touches is `last_row * width - 1`; a file truncated
+    // inside the strip would otherwise panic in a worker rather than fail the decode, and a
+    // library is free to contain a half-copied file.
+    if buf.len() < last_row * width {
+      return Err(RawlerError::DecoderFailed(format!(
+        "ARW2 wants {} bytes to reach row {} of a {width}px frame and the strip holds {}",
+        last_row * width,
+        last_row,
+        buf.len()
+      )));
+    }
+    let decoded = Rect::new(
+      Point::new(first_col * CHUNK, first_row),
+      Dim2::new((last_col - first_col) * CHUNK, last_row - first_row),
+    );
+
+    let out = decompress_lines_fn(decoded.d.w, decoded.d.h, dummy, &(|out: &mut [u16], row| {
+      // **Sought by byte, because a chunk is a whole number of them.** Thirty-two output pixels
+      // take two sub-blocks of 128 bits, so 32 bytes, and a row is `width` of them - which is why
+      // one pixel of ARW2 is one byte and why any chunk boundary is a byte boundary. Winding the
+      // pump instead would mean asking it for 256 bits at a time and it answers at most 32.
+      let row_at = (first_row + row) * width;
+      let mut pump = BitPumpLSB::new(&buf[(row_at + first_col * CHUNK)..]);
+      // The seed the *row* started with, wound forward over the pixels this row skipped. The
+      // refill is little-endian and takes a `u32` at a time, so a row's first `peek_bits(16)` is
+      // its first two bytes - and the advance below is `LookupTable::dither`'s own, which reads
+      // the seed and not the pixel, so winding it is arithmetic rather than a decode.
+      let mut random = u32::from(buf[row_at]) | (u32::from(buf[row_at + 1]) << 8);
+      for _ in 0..(first_col * CHUNK) {
+        random = 15700 * (random & 65535) + (random >> 16);
+      }
+
+      for out in out.chunks_exact_mut(CHUNK) {
+        for j in 0..2 {
+          let max = pump.get_bits(11);
+          let min = pump.get_bits(11);
+          let delta = max - min;
+          let delta_shift: u32 = cmp::max(0, (32 - (delta.leading_zeros() as i32)) - 7) as u32;
+          let imax = pump.get_bits(4) as usize;
+          let imin = pump.get_bits(4) as usize;
+
+          for i in 0..16 {
+            let val = if i == imax {
+              max
+            } else if i == imin {
+              min
+            } else {
+              cmp::min(0x7ff, (pump.get_bits(7) << delta_shift) + min)
+            };
+            out[j + (i * 2)] = curve.dither((val << 1) as u16, &mut random);
+          }
+        }
+      }
+      Ok(())
+    }))?;
+    Ok((out, decoded))
   }
 
   pub(crate) fn decode_arw2(buf: &[u8], width: usize, height: usize, curve: &LookupTable, dummy: bool) -> Result<PixU16> {

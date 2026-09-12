@@ -138,8 +138,21 @@ impl Rect {
     }
   }
 
+  /// LOCAL PATCH (bowerbird): saturating, and clamped so the near edge cannot pass the far one.
+  ///
+  /// **`RawImage::new` applies a camera's borders to whatever image it is handed**, and a region
+  /// decode hands it a rectangle of the frame rather than the frame - so a window smaller than the
+  /// masked border subtracts past zero and panics in the constructor, before the region path can
+  /// call `forget_geometry` to discard the area it never wanted. Degenerate rather than fatal: the
+  /// callers that want these numbers pass the frame's own dimensions, where the borders fit by
+  /// construction, and the one that cannot throws them away on the next line.
   pub fn new_with_borders(dim: Dim2, borders: &[usize; 4]) -> Self {
-    Self::new_with_points(Point::new(borders[0], borders[1]), Point::new(dim.w - borders[2], dim.h - borders[3]))
+    let right = dim.w.saturating_sub(borders[2]);
+    let bottom = dim.h.saturating_sub(borders[3]);
+    Self::new_with_points(
+      Point::new(borders[0].min(right), borders[1].min(bottom)),
+      Point::new(right, bottom),
+    )
   }
 
   /// DNG used top-left-bottom-right for all rectangles
