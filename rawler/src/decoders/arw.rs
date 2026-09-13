@@ -890,10 +890,9 @@ impl<'a> ArwDecoder<'a> {
 
   /// The white balance and levels, decrypted once per decoder.
   ///
-  /// **Held because it costs 64ms and does not depend on what is being decoded.** Sony keeps
-  /// these behind an encrypted block, so reading them means decrypting it and parsing an IFD out
-  /// of the result - the same answer every time, and on a 61MP frame more than the whole rest of
-  /// a tiled decode. A reader taking crop after crop of one photograph pays it once.
+  /// LOCAL PATCH (bowerbird): without the `OnceLock`, every crop of one photograph decrypts the
+  /// SR2 block Sony keeps these behind and parses an IFD out of it again. The answer does not
+  /// depend on what is being decoded, so a reader taking crop after crop pays for it once.
   fn get_params(&self, file: &RawSource) -> Result<ArwImageParams> {
     if let Some(params) = self.params.get() {
       return Ok(params.clone());
