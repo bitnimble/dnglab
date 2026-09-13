@@ -464,6 +464,19 @@ impl<'a> Decoder for RafDecoder<'a> {
     }
   }
 
+  /// LOCAL PATCH (bowerbird): the embedded JPEG undecoded, which this decoder could already find
+  /// and only ever handed back decoded.
+  ///
+  /// Without it the trait's default answers `None` and a RAF has no embedded preview at all - no
+  /// fast first paint, and no camera match, which is fitted against exactly this JPEG. Every other
+  /// decoder here implements it; `preview_image` below is the same bytes through `image`.
+  fn preview_jpeg<'b>(&self, file: &'b RawSource, params: &RawDecodeParams) -> Result<Option<&'b [u8]>> {
+    if params.image_index != 0 {
+      return Ok(None);
+    }
+    Ok(Some(self.read_embedded_jpeg(file)?))
+  }
+
   fn preview_image(&self, file: &RawSource, params: &RawDecodeParams) -> Result<Option<DynamicImage>> {
     if params.image_index != 0 {
       return Ok(None);
