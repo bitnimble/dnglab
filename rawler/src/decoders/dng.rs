@@ -115,6 +115,54 @@ impl<'a> Decoder for DngDecoder<'a> {
     Ok(None)
   }
 
+  /// LOCAL PATCH (bowerbird): see the trait's own note. The JPEG bytes of a DNG's preview SubIFD.
+  ///
+  /// **Without this a DNG has no preview at all as far as a caller is concerned**, and that is a
+  /// whole format rather than an edge: `preview_image` above finds the same IFD but answers a
+  /// decoded `DynamicImage`, where everything upstream that wants a body's own rendering -
+  /// `upright_preview_rgb`, and so `composite_align` and every stitch and merge behind it - reads
+  /// the undecoded bytes. So a burst of DNGs was refused with "embeds no preview to align on"
+  /// however many previews it embedded.
+  ///
+  /// The strips rather than `JPEGInterchangeFormat`: a DNG writes its preview as an ordinary
+  /// JPEG-compressed IFD, which is one strip per image for anything this size, so the whole JPEG is
+  /// `StripOffsets[0]` for `StripByteCounts[0]` bytes. A preview split across several strips is not
+  /// one JPEG and is left alone rather than concatenated into something that is not a file.
+  fn preview_jpegs<'b>(&self, file: &'b RawSource, params: &RawDecodeParams) -> Result<Vec<&'b [u8]>> {
+    if params.image_index != 0 {
+      return Ok(Vec::new());
+    }
+    let Some(subs) = self.tiff.root_ifd().get_sub_ifd_all(TiffCommonTag::SubIFDs) else {
+      return Ok(Vec::new());
+    };
+    let mut found = Vec::new();
+    for ifd in subs {
+      // The preview, not the raw: a DNG marks it `NewSubFileType` 1, as `preview_image` reads it.
+      if ifd.get_entry(TiffCommonTag::NewSubFileType).map(|at| at.force_u32(0)) != Some(1) {
+        continue;
+      }
+      let jpeg = ifd
+        .get_entry(TiffCommonTag::Compression)
+        .map(|at| at.force_u16(0) == CompressionMethod::ModernJPEG as u16);
+      if jpeg != Some(true) {
+        continue;
+      }
+      let (Some(offsets), Some(counts)) = (
+        ifd.get_entry(TiffCommonTag::StripOffsets),
+        ifd.get_entry(TiffCommonTag::StripByteCounts),
+      ) else {
+        continue;
+      };
+      if offsets.count() != 1 || counts.count() != 1 {
+        continue;
+      }
+      if let Ok(bytes) = file.subview(offsets.force_u64(0), counts.force_u64(0)) {
+        found.push(bytes);
+      }
+    }
+    Ok(found)
+  }
+
   fn ifd(&self, wk_ifd: WellKnownIFD) -> Result<Option<Rc<IFD>>> {
     Ok(match wk_ifd {
       WellKnownIFD::Root => Some(Rc::new(self.tiff.root_ifd().clone())),
