@@ -313,6 +313,11 @@ impl<'a> Decoder for ArwDecoder<'a> {
   fn format_hint(&self) -> FormatHint {
     FormatHint::ARW
   }
+
+  // LOCAL PATCH (bowerbird): see `Decoder::capture_sequence`.
+  fn capture_sequence(&self) -> Option<super::sequence::CaptureSequence> {
+    super::sequence::sony(&self.makernote, sony_tag9cxx_decipher)
+  }
 }
 
 impl<'a> ArwDecoder<'a> {

@@ -125,6 +125,8 @@ pub mod pef;
 pub mod qtk;
 pub mod raf;
 pub mod rw2;
+// LOCAL PATCH (bowerbird): see the module.
+pub mod sequence;
 pub mod srw;
 pub mod tfr;
 mod unwrapped;
@@ -435,6 +437,12 @@ pub trait Decoder: Send {
   /// unchanged.
   fn preview_jpegs<'a>(&self, file: &'a RawSource, params: &RawDecodeParams) -> Result<Vec<&'a [u8]>> {
     Ok(self.preview_jpeg(file, params)?.into_iter().collect())
+  }
+
+  /// LOCAL PATCH (bowerbird): the multi-shot capture this frame belongs to, where the body
+  /// recorded one. Without it a pixel-shift burst or a bracket imports as unrelated photographs.
+  fn capture_sequence(&self) -> Option<sequence::CaptureSequence> {
+    None
   }
 
   fn format_dump(&self) -> FormatDump;
