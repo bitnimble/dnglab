@@ -531,7 +531,7 @@ impl<'a> Decoder for Cr3Decoder<'a> {
 
   // LOCAL PATCH (bowerbird): see `Decoder::capture_sequence`.
   fn capture_sequence(&self) -> Option<super::sequence::CaptureSequence> {
-    super::sequence::canon(self.cmt3.root_ifd(), Cr3MakernoteTag::FileInfo as u16)
+    super::sequence::canon(self.cmt3.root_ifd(), Cr3MakernoteTag::FileInfo as u16, Cr3MakernoteTag::CameraSettings as u16)
   }
 }
 

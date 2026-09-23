@@ -107,6 +107,8 @@ pub fn parse_makernote<R: Read + Seek>(reader: &mut R, exif_ifd: &IFD) -> Result
             log::debug!("ORF ImageIFD not found");
           }
         }
+        // LOCAL PATCH (bowerbird): the drive mode `sequence::olympus` reads a focus bracket from.
+        camera_settings(reader, &mut mainifd, offset, endian);
         Ok(Some(mainifd))
       }
       _ => Err(RawlerError::DecoderFailed("EXIF makernote has unknown type".to_string())),
@@ -115,6 +117,24 @@ pub fn parse_makernote<R: Read + Seek>(reader: &mut R, exif_ifd: &IFD) -> Result
     Ok(None)
   }
 }
+
+/// LOCAL PATCH (bowerbird). The `CameraSettings` IFD, offset like the other two from the makernote.
+/// A file whose settings do not parse still decodes: they only say which capture a frame is of.
+fn camera_settings<R: Read + Seek>(reader: &mut R, mainifd: &mut IFD, offset: u32, endian: crate::bits::Endian) {
+  let Ok(Some(entry)) = mainifd.get_entry_raw_with_len(ORF_CAMERA_SETTINGS, reader, 4) else {
+    return;
+  };
+  let ioff = entry.get_force_u32(0);
+  if ioff == 0 {
+    return;
+  }
+  if let Ok(ifd) = IFD::new(reader, ioff, offset, 0, endian, &[]) {
+    mainifd.sub.insert(ORF_CAMERA_SETTINGS, vec![ifd]);
+  }
+}
+
+/// LOCAL PATCH (bowerbird). Olympus maker note `CameraSettings`.
+const ORF_CAMERA_SETTINGS: u16 = 0x2020;
 
 impl<'a> OrfDecoder<'a> {
   pub fn new(file: &RawSource, tiff: GenericTiffReader, rawloader: &'a RawLoader) -> Result<OrfDecoder<'a>> {
@@ -253,6 +273,11 @@ impl<'a> Decoder for OrfDecoder<'a> {
 
   fn format_hint(&self) -> FormatHint {
     FormatHint::ORF
+  }
+
+  // LOCAL PATCH (bowerbird): see `Decoder::capture_sequence`.
+  fn capture_sequence(&self) -> Option<super::sequence::CaptureSequence> {
+    super::sequence::olympus(self.makernote.get_sub_ifd(ORF_CAMERA_SETTINGS)?)
   }
 }
 

@@ -366,6 +366,19 @@ impl<'a> Decoder for NefDecoder<'a> {
   fn format_hint(&self) -> FormatHint {
     FormatHint::NEF
   }
+
+  // LOCAL PATCH (bowerbird): see `Decoder::capture_sequence`. `ShotInfo` is encrypted from byte 4.
+  fn capture_sequence(&self) -> Option<super::sequence::CaptureSequence> {
+    let Value::Undefined(encrypted) = &self.makernote.get_entry(NikonMakernote::ShotInfo)?.value else {
+      return None;
+    };
+    let mut shot_info = encrypted.clone();
+    if shot_info.len() <= 4 || self.makernote.get_entry(NikonMakernote::NefSerial).is_none() || self.makernote.get_entry(NikonMakernote::NefKey).is_none() {
+      return None;
+    }
+    decrypt::nef_decrypt(&mut shot_info, 4, &self.makernote).ok()?;
+    super::sequence::nikon(&shot_info, self.makernote.endian)
+  }
 }
 
 impl<'a> NefDecoder<'a> {
