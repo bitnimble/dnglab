@@ -316,7 +316,8 @@ impl<'a> Decoder for ArwDecoder<'a> {
 
   // LOCAL PATCH (bowerbird): see `Decoder::capture_sequence`.
   fn capture_sequence(&self) -> Option<super::sequence::CaptureSequence> {
-    super::sequence::sony(&self.makernote, sony_tag9cxx_decipher)
+    let exposure_mode = self.get_exif().ok().and_then(|exif| exif.get_entry(crate::tags::ExifTag::ExposureMode)).map(|entry| entry.force_u32(0));
+    super::sequence::sony(&self.makernote, exposure_mode, sony_tag9cxx_decipher)
   }
 }
 

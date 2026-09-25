@@ -36,13 +36,19 @@ const SONY_PIXEL_SHIFT: u16 = 0x202f;
 /// Sony maker note `0x9400`, enciphered, three layouts told apart by the first (enciphered) byte.
 const SONY_SEQUENCE: u16 = 0x9400;
 
-/// `ReleaseMode2` values that are an exposure bracket: continuous (`2`) and single-frame (`23`),
-/// the latter being what the ILCE-7 series writes. `3`, DRO or WB bracketing, is one exposure
-/// rendered three ways and so never a bracket to merge.
-const SONY_EXPOSURE_BRACKETS: [u8; 2] = [2, 23];
+/// `ReleaseMode2` of a continuous exposure bracket.
+const SONY_CONTINUOUS_BRACKET: u8 = 2;
+/// `ReleaseMode2` of a single-frame sequence, which exiftool calls an exposure bracket and the
+/// ILCE-7CR writes for a focus bracket and a pixel shift as well. `3`, DRO or WB bracketing, is one
+/// exposure rendered three ways and so never a bracket to merge.
+const SONY_SINGLE_FRAME_SEQUENCE: u8 = 23;
+/// EXIF `ExposureMode`'s auto bracket, which is what tells a single-frame exposure bracket from a
+/// focus bracket.
+const EXIF_AUTO_BRACKET: u32 = 2;
 
-pub(crate) fn sony(makernote: &IFD, decipher: impl Fn(&[u8]) -> Vec<u8>) -> Option<CaptureSequence> {
-  sony_pixel_shift(makernote).or_else(|| sony_exposure_bracket(makernote, decipher))
+/// `exposure_mode` is EXIF's `ExposureMode`.
+pub(crate) fn sony(makernote: &IFD, exposure_mode: Option<u32>, decipher: impl Fn(&[u8]) -> Vec<u8>) -> Option<CaptureSequence> {
+  sony_pixel_shift(makernote).or_else(|| sony_bracket(makernote, exposure_mode, decipher))
 }
 
 fn sony_pixel_shift(makernote: &IFD) -> Option<CaptureSequence> {
@@ -63,24 +69,31 @@ fn sony_pixel_shift(makernote: &IFD) -> Option<CaptureSequence> {
   })
 }
 
-fn sony_exposure_bracket(makernote: &IFD, decipher: impl Fn(&[u8]) -> Vec<u8>) -> Option<CaptureSequence> {
+fn sony_bracket(makernote: &IFD, exposure_mode: Option<u32>, decipher: impl Fn(&[u8]) -> Vec<u8>) -> Option<CaptureSequence> {
   let enciphered = bytes_of(makernote, SONY_SEQUENCE)?;
   let layout = SonySequenceLayout::of(*enciphered.first()?)?;
   let plain = decipher(enciphered);
   if plain.len() <= layout.shots.max(layout.image_number + 3) {
     return None;
   }
-  if !SONY_EXPOSURE_BRACKETS.contains(&plain[layout.release_mode]) {
-    return None;
-  }
+  let kind = sony_bracket_kind(plain[layout.release_mode], exposure_mode)?;
   let shots = plain[layout.shots] as u32;
   Some(CaptureSequence {
-    kind: SequenceKind::ExposureBracket,
+    kind,
     group: None,
     // Stored 0-based.
     index: Some(LEu32(&plain, layout.image_number).saturating_add(1)),
     count: (shots > 1).then_some(shots),
   })
+}
+
+fn sony_bracket_kind(release_mode: u8, exposure_mode: Option<u32>) -> Option<SequenceKind> {
+  match release_mode {
+    SONY_CONTINUOUS_BRACKET => Some(SequenceKind::ExposureBracket),
+    SONY_SINGLE_FRAME_SEQUENCE if exposure_mode == Some(EXIF_AUTO_BRACKET) => Some(SequenceKind::ExposureBracket),
+    SONY_SINGLE_FRAME_SEQUENCE => Some(SequenceKind::FocusBracket),
+    _ => None,
+  }
 }
 
 /// Where Tag9400a/b/c keep the three fields, per exiftool's `Sony.pm`.
@@ -239,6 +252,16 @@ mod tests {
     block[NIKON_SEQUENCE_OFFSET..NIKON_SEQUENCE_OFFSET + 4].copy_from_slice(&offset);
     block[at as usize + NIKON_FOCUS_SHIFT_SHOT] = shot;
     block
+  }
+
+  /// As an ILCE-7CR writes them: a continuous exposure bracket is `2` and auto bracket, and a focus
+  /// bracket `23` and not.
+  #[test]
+  fn a_sony_single_frame_sequence_is_a_focus_bracket_unless_it_auto_brackets() {
+    assert_eq!(sony_bracket_kind(2, Some(EXIF_AUTO_BRACKET)), Some(SequenceKind::ExposureBracket));
+    assert_eq!(sony_bracket_kind(23, Some(EXIF_AUTO_BRACKET)), Some(SequenceKind::ExposureBracket));
+    assert_eq!(sony_bracket_kind(23, Some(0)), Some(SequenceKind::FocusBracket));
+    assert_eq!(sony_bracket_kind(3, Some(EXIF_AUTO_BRACKET)), None, "a DRO bracket is one exposure");
   }
 
   #[test]
