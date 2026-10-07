@@ -219,11 +219,16 @@ impl LookupTable {
       let center = table[i];
       let lower = if i > 0 { table[i - 1] } else { center };
       let upper = if i < (table.len() - 1) { table[i + 1] } else { center };
-      // LOCAL PATCH (bowerbird): signed and clamped, as rawspeed's own table is. A file's table that
-      // falls or steps steeply otherwise panics here under overflow checks, failing the photo.
-      let spread = i32::from(upper) - i32::from(lower);
-      let base = if center == 0 { 0 } else { (i32::from(center) - (spread + 2) / 4).clamp(0, 0xffff) as u16 };
-      let delta = spread.max(0) as u16;
+      // LOCAL PATCH (bowerbird): signed, a falling step dithering flat at its centre and a steep one
+      // floored at 0. A file's table that falls or steps steeply otherwise panics here under
+      // overflow checks, failing the photo.
+      let spread = (i32::from(upper) - i32::from(lower)).max(0);
+      let base = if center == 0 {
+        0
+      } else {
+        (i32::from(center) - (spread + 2) / 4).max(0) as u16
+      };
+      let delta = spread as u16;
       tbl[i] = (center, base, delta);
     }
     LookupTable { table: tbl }
@@ -379,5 +384,33 @@ mod tests {
     assert_eq!(Binary32::EXPONENT_POS, 23);
     assert_eq!(Binary32::SIGN_BIT_POS, 31);
     assert_eq!(Binary32::STORAGE_BYTES, 4);
+  }
+
+  // LOCAL PATCH (bowerbird): pins the signed lookup table against upstream's for valid tables.
+  #[test]
+  fn a_rising_table_keeps_upstreams_dither() {
+    let table = LookupTable::new(&[0, 100, 300, 600]);
+    assert_eq!(table.table[1], (100, 100 - (300 + 2) / 4, 300));
+    assert_eq!(table.table[2], (300, 300 - (500 + 2) / 4, 500));
+  }
+
+  #[test]
+  fn a_falling_step_dithers_flat_at_its_centre() {
+    let table = LookupTable::new(&[1000, 500, 0]);
+    let mut random = 12345;
+    assert!((0..64).all(|_| table.dither(1, &mut random) == 500));
+  }
+
+  #[test]
+  fn a_steep_step_floors_at_zero() {
+    let table = LookupTable::new(&[0, 10, 65535]);
+    assert_eq!(table.table[1], (10, 0, 65535));
+  }
+
+  #[test]
+  fn a_short_table_pads_with_its_last_entry() {
+    let table = LookupTable::new_with_bits(&[0, 5], 16);
+    let mut random = 12345;
+    assert_eq!(table.dither(60000, &mut random), 5);
   }
 }
