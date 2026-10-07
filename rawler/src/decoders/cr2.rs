@@ -131,7 +131,9 @@ impl<'a> Decoder for Cr2Decoder<'a> {
           for i in 0..t.len() {
             t[i] = linearization.force_u16(i);
           }
-          LookupTable::new(&t)
+          // LOCAL PATCH (bowerbird): padded to 16 bits, since `dither` indexes by the raw value and
+          // corrupt data past 4095 would panic past the table's end.
+          LookupTable::new_with_bits(&t, 16)
         };
 
         let mut random = ljpegout[0] as u32;

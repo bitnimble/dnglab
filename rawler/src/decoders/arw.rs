@@ -676,7 +676,8 @@ impl<'a> ArwDecoder<'a> {
         for j in 0..2 {
           let max = pump.get_bits(11);
           let min = pump.get_bits(11);
-          let delta = max - min;
+          // LOCAL PATCH (bowerbird): see `decode_arw2`.
+          let delta = max.saturating_sub(min);
           let delta_shift: u32 = cmp::max(0, (32 - (delta.leading_zeros() as i32)) - 7) as u32;
           let imax = pump.get_bits(4) as usize;
           let imin = pump.get_bits(4) as usize;
@@ -712,7 +713,10 @@ impl<'a> ArwDecoder<'a> {
           for j in 0..2 {
             let max = pump.get_bits(11);
             let min = pump.get_bits(11);
-            let delta = max - min;
+            // LOCAL PATCH (bowerbird): a corrupt block can hold max under min, and the plain
+            // subtraction then panics under overflow checks, failing the whole photo. LibRaw's
+            // signed arithmetic reads it as no spread, which saturating matches.
+            let delta = max.saturating_sub(min);
             // Calculate the size of the data shift needed by how large the delta is
             // A delta with 11 bits requires a shift of 4, 10 bits of 3, etc
             let delta_shift: u32 = cmp::max(0, (32 - (delta.leading_zeros() as i32)) - 7) as u32;

@@ -750,7 +750,7 @@ pub fn plain_image_from_ifd(ifd: &IFD, rawsource: &RawSource) -> Result<RawImage
       pixbuf = pixbuf.into_crop(Rect::new(Point::zero(), Dim2::new(tiff_width * cpp, tiff_height)));
 
       if let Some(lintable) = ifd.get_entry(TiffCommonTag::Linearization) {
-        apply_linearization(&mut pixbuf, &lintable.value, bits);
+        apply_linearization(&mut pixbuf, &lintable.value, bits)?;
       }
 
       // DNG 1.7.1 may store JPEG-XL data in interleaved format
@@ -896,23 +896,27 @@ where
   Ok(pixbuf)
 }
 
-pub(crate) fn apply_linearization(image: &mut PixU16, tbl: &Value, bits: u32) {
+// LOCAL PATCH (bowerbird): a `Result`. A table of the wrong type is the file's fault, and upstream's
+// panic for it takes the caller down with the decode.
+pub(crate) fn apply_linearization(image: &mut PixU16, tbl: &Value, _bits: u32) -> Result<()> {
   match tbl {
     Value::Short(points) => {
       if points.is_empty() {
-        return;
+        return Ok(());
       }
-      let table = LookupTable::new_with_bits(points, bits);
+      // LOCAL PATCH (bowerbird): padded to 16 bits. A file can store values past its own bit
+      // depth, and `dither` indexes by the raw value, so a shorter table panics past its end.
+      // LibRaw pads with the last entry too.
+      let table = LookupTable::new_with_bits(points, 16);
       image.par_pixel_rows_mut().for_each(|row| {
         let mut random = LEu32(row.as_bytes(), 0);
         row.iter_mut().for_each(|p| {
           *p = table.dither(*p, &mut random);
         })
       });
+      Ok(())
     }
-    _ => {
-      panic!("Unsupported linear table");
-    }
+    _ => Err(RawlerError::DecoderFailed("DNG: unsupported linearization table type".into())),
   }
 }
 

@@ -219,8 +219,11 @@ impl LookupTable {
       let center = table[i];
       let lower = if i > 0 { table[i - 1] } else { center };
       let upper = if i < (table.len() - 1) { table[i + 1] } else { center };
-      let base = if center == 0 { 0 } else { center - ((upper - lower + 2) / 4) };
-      let delta = upper - lower;
+      // LOCAL PATCH (bowerbird): signed and clamped, as rawspeed's own table is. A file's table that
+      // falls or steps steeply otherwise panics here under overflow checks, failing the photo.
+      let spread = i32::from(upper) - i32::from(lower);
+      let base = if center == 0 { 0 } else { (i32::from(center) - (spread + 2) / 4).clamp(0, 0xffff) as u16 };
+      let delta = spread.max(0) as u16;
       tbl[i] = (center, base, delta);
     }
     LookupTable { table: tbl }
